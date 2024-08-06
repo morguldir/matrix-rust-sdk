@@ -18,20 +18,15 @@ use std::{fmt, sync::Arc};
 
 use imbl::{vector, Vector};
 use matrix_sdk::{deserialized_responses::TimelineEvent, Room};
-use ruma::{
-    assign,
-    events::{
-        relation::{InReplyTo, Thread},
-        room::message::{
-            MessageType, Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
-            SyncRoomMessageEvent,
-        },
-        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnyTimelineEvent,
-        BundledMessageLikeRelations, Mentions,
+use ruma::{assign, events::{
+    relation::{InReplyTo, Thread},
+    room::message::{
+        MessageType, Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+        SyncRoomMessageEvent,
     },
-    html::RemoveReplyFallback,
-    OwnedEventId, OwnedUserId, RoomVersionId, UserId,
-};
+    AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnyTimelineEvent,
+    BundledMessageLikeRelations, Mentions,
+}, html::RemoveReplyFallback, OwnedEventId, OwnedUserId, RoomVersionId, UserId};
 use tracing::error;
 
 use super::TimelineItemContent;
@@ -56,6 +51,16 @@ pub struct Message {
 }
 
 impl Message {
+    pub fn forwarded(msgtype: MessageType) -> Self {
+        Self {
+            msgtype,
+            in_reply_to: None,
+            thread_root: None,
+            edited: false,
+            mentions: None,
+        }
+    }
+
     /// Construct a `Message` from a `m.room.message` event.
     pub(in crate::timeline) fn from_event(
         c: RoomMessageEventContent,
@@ -137,6 +142,10 @@ impl Message {
     /// Whether this message is part of a thread.
     pub fn is_threaded(&self) -> bool {
         self.thread_root.is_some()
+    }
+
+    pub fn thread_root(&self) -> Option<OwnedEventId> {
+        self.thread_root.clone()
     }
 
     /// Get the edit state of this message (has been edited: `true` /

@@ -55,7 +55,9 @@ use crate::{
     error::{ClientError, MediaInfoError},
     helpers::unwrap_or_clone_arc,
     utils::u64_to_uint,
+    timeline::FFIMessage,
 };
+use crate::timeline::FFIEventTimelineItem;
 
 #[derive(uniffi::Enum)]
 pub enum AuthData {
@@ -227,6 +229,7 @@ pub impl RoomMessageEventContentWithoutRelationExt for RoomMessageEventContentWi
     }
 }
 
+#[derive(Clone)]
 pub struct Mentions {
     pub user_ids: Vec<String>,
     pub room: bool,
@@ -834,7 +837,7 @@ impl From<&RumaFileInfo> for FileInfo {
     }
 }
 
-#[derive(uniffi::Enum)]
+#[derive(Clone, uniffi::Enum)]
 pub enum PollKind {
     Disclosed,
     Undisclosed,
@@ -860,4 +863,10 @@ impl From<RumaPollKind> for PollKind {
             }
         }
     }
+}
+
+#[uniffi::export]
+pub fn content_without_relation_from_message(message: FFIMessage) -> Result<RoomMessageEventContentWithoutRelation, ClientError> {
+    let msg_type = message.msg_type.try_into().map_err(|e| ClientError::new(e))?;
+    Ok(RoomMessageEventContentWithoutRelation::new(msg_type))
 }

@@ -27,31 +27,27 @@ use matrix_sdk::{
     deserialized_responses::{ShieldState as RustShieldState, ShieldStateCode},
     Error,
 };
-use matrix_sdk_ui::timeline::{
-    EventItemOrigin, LiveBackPaginationStatus, Profile, RepliedToEvent, TimelineDetails,
-};
+use matrix_sdk_ui::timeline::{EventItemOrigin, LiveBackPaginationStatus, Profile, RepliedToEvent, TimelineDetails, TimelineEventItemId, UnsupportedEditItem};
 use mime::Mime;
-use ruma::{
-    events::{
-        location::{AssetType as RumaAssetType, LocationContent, ZoomLevel},
-        poll::{
-            unstable_end::UnstablePollEndEventContent,
-            unstable_response::UnstablePollResponseEventContent,
-            unstable_start::{
-                NewUnstablePollStartEventContent, UnstablePollAnswer, UnstablePollAnswers,
-                UnstablePollStartContentBlock,
-            },
+use ruma::{events::{
+    location::{AssetType as RumaAssetType, LocationContent, ZoomLevel},
+    poll::{
+        unstable_end::UnstablePollEndEventContent,
+        unstable_response::UnstablePollResponseEventContent,
+        unstable_start::{
+            NewUnstablePollStartEventContent, UnstablePollAnswer, UnstablePollAnswers,
+            UnstablePollStartContentBlock,
         },
-        receipt::ReceiptThread,
-        relation::Annotation,
-        room::message::{
-            ForwardThread, LocationMessageEventContent, MessageType,
-            RoomMessageEventContentWithoutRelation,
-        },
-        AnyMessageLikeEventContent,
     },
-    EventId, OwnedTransactionId,
-};
+    receipt::ReceiptThread,
+    relation::Annotation,
+    room::message::{
+        ForwardThread, LocationMessageEventContent, MessageType,
+        RoomMessageEventContentWithoutRelation,
+    },
+    AnyMessageLikeEventContent,
+}, EventId, OwnedTransactionId, OwnedEventId, TransactionId};
+use ruma::events::room::message::RoomMessageEventContent;
 use tokio::{
     sync::Mutex,
     task::{AbortHandle, JoinHandle},
@@ -73,6 +69,8 @@ use crate::{
 };
 
 mod content;
+
+pub use content::FFIMessage;
 
 #[derive(uniffi::Object)]
 #[repr(transparent)]
@@ -557,14 +555,14 @@ impl Timeline {
     pub async fn get_event_timeline_item_by_event_id(
         &self,
         event_id: String,
-    ) -> Result<Arc<EventTimelineItem>, ClientError> {
+    ) -> Result<FFIEventTimelineItem, ClientError> {
         let event_id = EventId::parse(event_id)?;
         let item = self
             .inner
             .item_by_event_id(&event_id)
             .await
             .context("Item with given event ID not found")?;
-        Ok(Arc::new(EventTimelineItem(item)))
+        Ok(item.into())
     }
 
     /// Get the current timeline item for the given transaction ID, if any.
@@ -639,7 +637,7 @@ impl Timeline {
             Ok(replied_to) => Ok(InReplyToDetails::new(
                 event_id_str,
                 RepliedToEventDetails::Ready {
-                    content: Arc::new(TimelineItemContent(replied_to.content().clone())),
+                    content: replied_to.content().into(),
                     sender: replied_to.sender().to_string(),
                     sender_profile: replied_to.sender_profile().into(),
                 },
@@ -670,6 +668,11 @@ impl Timeline {
     async fn unpin_event(&self, event_id: String) -> Result<bool, ClientError> {
         let event_id = EventId::parse(event_id).map_err(ClientError::from)?;
         self.inner.unpin_event(&event_id).await.map_err(ClientError::from)
+    }
+
+    pub fn create_message_content(&self, msg_type: crate::ruma::MessageType) -> Option<Arc<RoomMessageEventContentWithoutRelation>> {
+        let msg_type: Option<MessageType> = msg_type.try_into().ok();
+        msg_type.map(|m| Arc::new(RoomMessageEventContentWithoutRelation::new(m)))
     }
 }
 
@@ -866,9 +869,9 @@ impl TimelineItem {
 
 #[uniffi::export]
 impl TimelineItem {
-    pub fn as_event(self: Arc<Self>) -> Option<Arc<EventTimelineItem>> {
+    pub fn as_event(self: Arc<Self>) -> Option<FFIEventTimelineItem> {
         let event_item = self.0.as_event()?;
-        Some(Arc::new(EventTimelineItem(event_item.clone())))
+        Some(event_item.clone().into())
     }
 
     pub fn as_virtual(self: Arc<Self>) -> Option<VirtualTimelineItem> {
@@ -951,6 +954,81 @@ impl From<RustShieldState> for ShieldState {
     }
 }
 
+#[derive(Clone, uniffi::Record)]
+pub struct FFIEventTimelineItem {
+    is_local: bool,
+    is_remote: bool,
+    transaction_id: Option<String>,
+    event_id: Option<String>,
+    sender: String,
+    sender_profile: ProfileDetails,
+    is_own: bool,
+    is_editable: bool,
+    content: TimelineItemContent,
+    timestamp: u64,
+    reactions: Vec<Reaction>,
+    debug_info: EventTimelineItemDebugInfo,
+    local_send_state: Option<EventSendState>,
+    read_receipts: HashMap<String, Receipt>,
+    origin: Option<EventItemOrigin>,
+    can_be_replied_to: bool,
+}
+
+impl FFIEventTimelineItem {
+    pub(crate) fn identifier(&self) -> TimelineEventItemId {
+        if let Some(Ok(id)) = self.event_id.clone().map(|i| EventId::parse(&i)) {
+            TimelineEventItemId::EventId(id.clone())
+        } else if let Some(id) = self.transaction_id.clone() {
+            TimelineEventItemId::TransactionId(id.into())
+        } else {
+            panic!("EventTimelineItem has no event_id or transaction_id");
+        }
+    }
+}
+
+impl From<matrix_sdk_ui::timeline::EventTimelineItem> for FFIEventTimelineItem {
+    fn from(value: matrix_sdk_ui::timeline::EventTimelineItem) -> Self {
+        let reactions = value
+            .reactions()
+            .iter()
+            .map(|(k, v)| Reaction {
+                key: k.to_owned(),
+                senders: v
+                    .into_iter()
+                    .map(|(sender_id, info)| ReactionSenderData {
+                        sender_id: sender_id.to_string(),
+                        timestamp: info.timestamp.0.into(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let debug_info = EventTimelineItemDebugInfo {
+            model: format!("{:#?}", value),
+            original_json: value.original_json().map(|raw| raw.json().get().to_owned()),
+            latest_edit_json: value.latest_edit_json().map(|raw| raw.json().get().to_owned()),
+        };
+        let read_receipts = value.read_receipts().iter().map(|(k, v)| (k.to_string(), v.clone().into())).collect();
+        Self {
+            is_local: value.is_local_echo(),
+            is_remote: !value.is_local_echo(),
+            transaction_id: value.transaction_id().map(|t| t.to_string()),
+            event_id: value.event_id().map(|e| e.to_string()),
+            sender: value.sender().to_string(),
+            sender_profile: value.sender_profile().into(),
+            is_own: value.is_own(),
+            is_editable: value.is_editable(),
+            content: value.content().into(),
+            timestamp: value.timestamp().0.into(),
+            reactions,
+            debug_info,
+            local_send_state: value.send_state().map(|s| s.into()),
+            read_receipts,
+            origin: value.origin(),
+            can_be_replied_to: value.can_be_replied_to()
+        }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct EventTimelineItem(pub(crate) matrix_sdk_ui::timeline::EventTimelineItem);
 
@@ -988,8 +1066,8 @@ impl EventTimelineItem {
         self.0.is_editable()
     }
 
-    pub fn content(&self) -> Arc<TimelineItemContent> {
-        Arc::new(TimelineItemContent(self.0.content().clone()))
+    pub fn content(&self) -> TimelineItemContent {
+        self.0.content().into()
     }
 
     pub fn timestamp(&self) -> u64 {
@@ -1044,7 +1122,7 @@ impl EventTimelineItem {
     }
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, uniffi::Record)]
 pub struct Receipt {
     pub timestamp: Option<u64>,
 }
@@ -1055,14 +1133,14 @@ impl From<ruma::events::receipt::Receipt> for Receipt {
     }
 }
 
-#[derive(uniffi::Record)]
+#[derive(Clone, uniffi::Record)]
 pub struct EventTimelineItemDebugInfo {
     model: String,
     original_json: Option<String>,
     latest_edit_json: Option<String>,
 }
 
-#[derive(uniffi::Enum)]
+#[derive(Clone, uniffi::Enum)]
 pub enum ProfileDetails {
     Unavailable,
     Pending,

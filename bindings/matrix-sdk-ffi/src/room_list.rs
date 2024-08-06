@@ -29,6 +29,7 @@ use crate::{
     timeline_event_filter::TimelineEventTypeFilter,
     TaskHandle, RUNTIME,
 };
+use crate::timeline::FFIEventTimelineItem;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum RoomListError {
@@ -653,8 +654,8 @@ impl RoomListItem {
         self.inner.subscribe(settings.map(Into::into));
     }
 
-    async fn latest_event(&self) -> Option<Arc<EventTimelineItem>> {
-        self.inner.latest_event().await.map(EventTimelineItem).map(Arc::new)
+    async fn latest_event(&self) -> Option<FFIEventTimelineItem> {
+        self.inner.latest_event().await.map(|e| e.into())
     }
 }
 
