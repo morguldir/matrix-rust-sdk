@@ -28,8 +28,8 @@ use futures_util::Stream;
 use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
-    store::DynCryptoStore, EncryptionSettings, EncryptionSyncChanges, OlmError, OlmMachine,
-    ToDeviceRequest,
+    store::DynCryptoStore, CollectStrategy, EncryptionSettings, EncryptionSyncChanges, OlmError,
+    OlmMachine, ToDeviceRequest,
 };
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
@@ -108,6 +108,11 @@ pub struct BaseClient {
     /// event contains the room and a boolean whether this event should
     /// trigger a room list update.
     pub(crate) room_info_notable_update_sender: broadcast::Sender<RoomInfoNotableUpdate>,
+
+    /// The strategy to use for picking recipient devices, when sending an
+    /// encrypted message.
+    #[cfg(feature = "e2e-encryption")]
+    pub room_key_recipient_strategy: CollectStrategy,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -144,17 +149,28 @@ impl BaseClient {
             olm_machine: Default::default(),
             ignore_user_list_changes: Default::default(),
             room_info_notable_update_sender,
+            #[cfg(feature = "e2e-encryption")]
+            room_key_recipient_strategy: Default::default(),
         }
     }
 
     /// Clones the current base client to use the same crypto store but a
     /// different, in-memory store config, and resets transient state.
+    #[cfg(feature = "e2e-encryption")]
     pub fn clone_with_in_memory_state_store(&self) -> Self {
         let config = StoreConfig::new().state_store(MemoryStore::new());
-
-        #[cfg(feature = "e2e-encryption")]
         let config = config.crypto_store(self.crypto_store.clone());
 
+        let mut result = Self::with_store_config(config);
+        result.room_key_recipient_strategy = self.room_key_recipient_strategy.clone();
+        result
+    }
+
+    /// Clones the current base client to use the same crypto store but a
+    /// different, in-memory store config, and resets transient state.
+    #[cfg(not(feature = "e2e-encryption"))]
+    pub fn clone_with_in_memory_state_store(&self) -> Self {
+        let config = StoreConfig::new().state_store(MemoryStore::new());
         Self::with_store_config(config)
     }
 
@@ -256,7 +272,6 @@ impl BaseClient {
 
         // Recreate the `OlmMachine` and wipe the in-memory cache in the store
         // because we suspect it has stale data.
-        self.crypto_store.clear_caches().await;
         let olm_machine = OlmMachine::with_store(
             &session_meta.user_id,
             &session_meta.device_id,
@@ -841,7 +856,7 @@ impl BaseClient {
             let mut changes = StateChanges::default();
             changes.add_room(room_info.clone());
             self.store.save_changes(&changes).await?; // Update the store
-            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::empty());
+            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
         }
 
         Ok(room)
@@ -867,7 +882,7 @@ impl BaseClient {
             let mut changes = StateChanges::default();
             changes.add_room(room_info.clone());
             self.store.save_changes(&changes).await?; // Update the store
-            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::empty());
+            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
         }
 
         Ok(())
@@ -1392,7 +1407,11 @@ impl BaseClient {
                 let members = self.store.get_user_ids(room_id, filter).await?;
 
                 let settings = settings.ok_or(Error::EncryptionNotEnabled)?;
-                let settings = EncryptionSettings::new(settings, history_visibility, false);
+                let settings = EncryptionSettings::new(
+                    settings,
+                    history_visibility,
+                    self.room_key_recipient_strategy.clone(),
+                );
 
                 Ok(o.share_room_key(room_id, members.iter().map(Deref::deref), settings).await?)
             }
@@ -1618,15 +1637,10 @@ fn handle_room_member_event_for_profiles(
 #[cfg(test)]
 mod tests {
     use matrix_sdk_test::{
-        async_test, response_from_file, sync_timeline_event, InvitedRoomBuilder, LeftRoomBuilder,
-        StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
+        async_test, ruma_response_from_json, sync_timeline_event, InvitedRoomBuilder,
+        LeftRoomBuilder, StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
     };
-    use ruma::{
-        api::{client as api, IncomingResponse},
-        room_id,
-        serde::Raw,
-        user_id, UserId,
-    };
+    use ruma::{api::client as api, room_id, serde::Raw, user_id, UserId};
     use serde_json::{json, value::to_raw_value};
 
     use super::BaseClient;
@@ -1686,7 +1700,7 @@ mod tests {
 
         let client = logged_in_base_client(Some(user_id)).await;
 
-        let response = api::sync::sync_events::v3::Response::try_from_http_response(response_from_file(&json!({
+        let response = ruma_response_from_json(&json!({
             "next_batch": "asdkl;fjasdkl;fj;asdkl;f",
             "device_one_time_keys_count": {
                 "signed_curve25519": 50u64
@@ -1755,7 +1769,7 @@ mod tests {
                     }
                 }
             }
-        }))).expect("static json doesn't fail to parse");
+        }));
 
         client.receive_sync_response(response).await.unwrap();
 
@@ -1849,39 +1863,36 @@ mod tests {
             .await
             .unwrap();
 
-        let response = api::sync::sync_events::v3::Response::try_from_http_response(
-            response_from_file(&json!({
-                "next_batch": "asdkl;fjasdkl;fj;asdkl;f",
-                "rooms": {
-                    "join": {
-                        "!ithpyNKDtmhneaTQja:example.org": {
-                            "state": {
-                                "events": [
-                                    {
-                                        "invalid": "invalid",
+        let response = ruma_response_from_json(&json!({
+            "next_batch": "asdkl;fjasdkl;fj;asdkl;f",
+            "rooms": {
+                "join": {
+                    "!ithpyNKDtmhneaTQja:example.org": {
+                        "state": {
+                            "events": [
+                                {
+                                    "invalid": "invalid",
+                                },
+                                {
+                                    "content": {
+                                        "name": "The room name"
                                     },
-                                    {
-                                        "content": {
-                                            "name": "The room name"
-                                        },
-                                        "event_id": "$143273582443PhrSn:example.org",
-                                        "origin_server_ts": 1432735824653u64,
-                                        "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
-                                        "sender": "@example:example.org",
-                                        "state_key": "",
-                                        "type": "m.room.name",
-                                        "unsigned": {
-                                            "age": 1234
-                                        }
-                                    },
-                                ]
-                            }
+                                    "event_id": "$143273582443PhrSn:example.org",
+                                    "origin_server_ts": 1432735824653u64,
+                                    "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
+                                    "sender": "@example:example.org",
+                                    "state_key": "",
+                                    "type": "m.room.name",
+                                    "unsigned": {
+                                        "age": 1234
+                                    }
+                                },
+                            ]
                         }
                     }
                 }
-            })),
-        )
-        .expect("static json doesn't fail to parse");
+            }
+        }));
 
         client.receive_sync_response(response).await.unwrap();
         client

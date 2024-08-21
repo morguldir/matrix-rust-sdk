@@ -1,9 +1,12 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use matrix_sdk::{
     authentication::qrcode::{self, DeviceCodeErrorResponseType, LoginFailureReason},
-    crypto::types::qr_login::{LoginQrCodeDecodeError, QrCodeModeData},
+    crypto::{
+        types::qr_login::{LoginQrCodeDecodeError, QrCodeModeData},
+        CollectStrategy,
+    },
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     reqwest::Certificate,
     ruma::{ServerName, UserId},
@@ -259,6 +262,8 @@ pub struct ClientBuilder {
     additional_root_certificates: Vec<Vec<u8>>,
     disable_built_in_root_certificates: bool,
     encryption_settings: EncryptionSettings,
+    room_key_recipient_strategy: CollectStrategy,
+    request_config: Option<RequestConfig>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -288,6 +293,8 @@ impl ClientBuilder {
                     matrix_sdk::encryption::BackupDownloadStrategy::AfterDecryptionFailure,
                 auto_enable_backups: false,
             },
+            room_key_recipient_strategy: Default::default(),
+            request_config: Default::default(),
         })
     }
 
@@ -442,6 +449,21 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
+    /// Set the strategy to be used for picking recipient devices when sending
+    /// an encrypted message.
+    pub fn room_key_recipient_strategy(self: Arc<Self>, strategy: CollectStrategy) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.room_key_recipient_strategy = strategy;
+        Arc::new(builder)
+    }
+
+    /// Add a default request config to this client.
+    pub fn request_config(self: Arc<Self>, config: RequestConfig) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.request_config = Some(config);
+        Arc::new(builder)
+    }
+
     pub async fn build(self: Arc<Self>) -> Result<Arc<Client>, ClientBuildError> {
         let builder = unwrap_or_clone_arc(self);
         let mut inner_builder = MatrixClient::builder();
@@ -524,7 +546,9 @@ impl ClientBuilder {
             inner_builder = inner_builder.user_agent(user_agent);
         }
 
-        inner_builder = inner_builder.with_encryption_settings(builder.encryption_settings);
+        inner_builder = inner_builder
+            .with_encryption_settings(builder.encryption_settings)
+            .with_room_key_recipient_strategy(builder.room_key_recipient_strategy);
 
         if let Some(sliding_sync_proxy) = builder.sliding_sync_proxy {
             inner_builder = inner_builder.sliding_sync_proxy(sliding_sync_proxy);
@@ -535,6 +559,27 @@ impl ClientBuilder {
 
         if builder.requires_sliding_sync {
             inner_builder = inner_builder.requires_sliding_sync();
+        }
+
+        if let Some(config) = builder.request_config {
+            let mut updated_config = matrix_sdk::config::RequestConfig::default();
+            if let Some(retry_limit) = config.retry_limit {
+                updated_config = updated_config.retry_limit(retry_limit);
+            }
+            if let Some(timeout) = config.timeout {
+                updated_config = updated_config.timeout(Duration::from_millis(timeout));
+            }
+            if let Some(max_concurrent_requests) = config.max_concurrent_requests {
+                if max_concurrent_requests > 0 {
+                    updated_config = updated_config.max_concurrent_requests(NonZeroUsize::new(
+                        max_concurrent_requests as usize,
+                    ));
+                }
+            }
+            if let Some(retry_timeout) = config.retry_timeout {
+                updated_config = updated_config.retry_timeout(Duration::from_millis(retry_timeout));
+            }
+            inner_builder = inner_builder.request_config(updated_config);
         }
 
         let sdk_client = inner_builder.build().await?;
@@ -601,4 +646,17 @@ impl ClientBuilder {
 
         Ok(client)
     }
+}
+
+#[derive(Clone, uniffi::Record)]
+/// The config to use for HTTP requests by default in this client.
+pub struct RequestConfig {
+    /// Max number of retries.
+    retry_limit: Option<u64>,
+    /// Timeout for a request in milliseconds.
+    timeout: Option<u64>,
+    /// Max number of concurrent requests. No value means no limits.
+    max_concurrent_requests: Option<u64>,
+    /// Base delay between retries.
+    retry_timeout: Option<u64>,
 }

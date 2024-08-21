@@ -26,10 +26,12 @@ use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use indexmap::IndexMap;
 use matrix_sdk::{
+    config::RequestConfig,
     deserialized_responses::{SyncTimelineEvent, TimelineEvent},
     event_cache::paginator::{PaginableRoom, PaginatorError},
     room::{EventWithContextResponse, Messages, MessagesOptions},
     send_queue::RoomSendQueueUpdate,
+    test_utils::events::EventFactory,
 };
 use matrix_sdk_base::latest_event::LatestEvent;
 use matrix_sdk_test::{EventBuilder, ALICE, BOB};
@@ -38,7 +40,7 @@ use ruma::{
     events::{
         receipt::{Receipt, ReceiptThread, ReceiptType},
         relation::Annotation,
-        AnyMessageLikeEventContent, AnyTimelineEvent, EmptyStateKey, MessageLikeEventContent,
+        AnyMessageLikeEventContent, AnyTimelineEvent, EmptyStateKey,
         RedactedMessageLikeEventContent, RedactedStateEventContent, StaticStateEventContent,
     },
     int,
@@ -79,6 +81,9 @@ mod virt;
 struct TestTimeline {
     inner: TimelineInner<TestRoomDataProvider>,
     event_builder: EventBuilder,
+    /// An [`EventFactory`] that can be used for creating events in this
+    /// timeline.
+    pub factory: EventFactory,
 }
 
 impl TestTimeline {
@@ -96,6 +101,7 @@ impl TestTimeline {
                 false,
             ),
             event_builder: EventBuilder::new(),
+            factory: EventFactory::new(),
         }
     }
 
@@ -103,6 +109,7 @@ impl TestTimeline {
         Self {
             inner: TimelineInner::new(room_data_provider, TimelineFocus::Live, None, None, false),
             event_builder: EventBuilder::new(),
+            factory: EventFactory::new(),
         }
     }
 
@@ -116,9 +123,11 @@ impl TestTimeline {
                 true,
             ),
             event_builder: EventBuilder::new(),
+            factory: EventFactory::new(),
         }
     }
 
+    // TODO: this is wrong, see also #3850.
     fn with_is_room_encrypted(encrypted: bool) -> Self {
         Self {
             inner: TimelineInner::new(
@@ -129,6 +138,7 @@ impl TestTimeline {
                 encrypted,
             ),
             event_builder: EventBuilder::new(),
+            factory: EventFactory::new(),
         }
     }
 
@@ -152,14 +162,6 @@ impl TestTimeline {
 
     async fn len(&self) -> usize {
         self.inner.items().await.len()
-    }
-
-    async fn handle_live_message_event<C>(&self, sender: &UserId, content: C)
-    where
-        C: MessageLikeEventContent,
-    {
-        let ev = self.event_builder.make_sync_message_event(sender, content);
-        self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
     }
 
     async fn handle_live_redacted_message_event<C>(&self, sender: &UserId, content: C)
@@ -321,7 +323,11 @@ impl PaginableRoom for TestRoomDataProvider {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl PinnedEventsRoom for TestRoomDataProvider {
-    async fn event(&self, _event_id: &EventId) -> Result<SyncTimelineEvent, PaginatorError> {
+    async fn load_event(
+        &self,
+        _event_id: &EventId,
+        _config: Option<RequestConfig>,
+    ) -> Result<SyncTimelineEvent, PaginatorError> {
         unimplemented!();
     }
 
