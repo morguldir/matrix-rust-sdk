@@ -12,12 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
+
 use matrix_sdk::{crypto::types::events::UtdCause, room::power_levels::power_level_user_changes};
 use matrix_sdk_ui::timeline::{Message, PollResult, RoomPinnedEventsChange, TimelineDetails};
-use ruma::events::room::{message::RoomMessageEventContentWithoutRelation, MediaSource};
-use ruma::OwnedEventId;
+use ruma::{
+    events::room::{message::RoomMessageEventContentWithoutRelation, MediaSource},
+    OwnedEventId,
+};
 use tracing::warn;
 
 use super::ProfileDetails;
@@ -28,9 +33,7 @@ impl From<&matrix_sdk_ui::timeline::TimelineItemContent> for TimelineItemContent
         use matrix_sdk_ui::timeline::TimelineItemContent as Content;
 
         match value {
-            Content::Message(message) => TimelineItemContent::Message {
-                content: message.into()
-            },
+            Content::Message(message) => TimelineItemContent::Message { content: message.into() },
 
             Content::RedactedMessage => TimelineItemContent::RedactedMessage,
 
@@ -105,7 +108,7 @@ impl From<&matrix_sdk_ui::timeline::TimelineItemContent> for TimelineItemContent
 }
 
 #[derive(Clone, uniffi::Record)]
-pub struct FFIMessage {
+pub struct MessageContent {
     pub msg_type: MessageType,
     pub body: String,
     pub in_reply_to: Option<Arc<InReplyToDetails>>,
@@ -114,7 +117,7 @@ pub struct FFIMessage {
     pub mentions: Option<Mentions>,
 }
 
-impl From<&matrix_sdk_ui::timeline::Message> for FFIMessage {
+impl From<&matrix_sdk_ui::timeline::Message> for MessageContent {
     fn from(value: &matrix_sdk_ui::timeline::Message) -> Self {
         Self {
             msg_type: value.msgtype().clone().into(),
@@ -139,7 +142,7 @@ impl From<ruma::events::Mentions> for Mentions {
 #[derive(Clone, uniffi::Enum)]
 pub enum TimelineItemContent {
     Message {
-        content: FFIMessage,
+        content: MessageContent,
     },
     RedactedMessage,
     Sticker {

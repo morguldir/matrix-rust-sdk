@@ -58,7 +58,7 @@ use ruma::{
 use thiserror::Error;
 use tracing::{error, instrument, trace, warn};
 
-use crate::timeline::pinned_events_loader::PinnedEventsRoom;
+use crate::timeline::{pinned_events_loader::PinnedEventsRoom, util::rfind_event_by_uid};
 
 mod builder;
 mod controller;
@@ -266,6 +266,12 @@ impl Timeline {
         let (_, item) = rfind_event_item(&items, |item| {
             item.as_local().map_or(false, |local| local.transaction_id == target)
         })?;
+        Some(item.to_owned())
+    }
+
+    pub async fn item_by_unique_id(&self, target: &String) -> Option<EventTimelineItem> {
+        let items = self.controller.items().await;
+        let (_, item) = rfind_event_by_uid(&items, target)?;
         Some(item.to_owned())
     }
 

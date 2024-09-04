@@ -25,11 +25,10 @@ use crate::{
     error::ClientError,
     room::{Membership, Room},
     room_info::RoomInfo,
-    timeline::Timeline,
+    timeline::{EventTimelineItem, Timeline},
     timeline_event_filter::TimelineEventTypeFilter,
     TaskHandle, RUNTIME,
 };
-use crate::timeline::EventTimelineItem;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum RoomListError {

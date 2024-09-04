@@ -18,15 +18,20 @@ use std::{fmt, sync::Arc};
 
 use imbl::{vector, Vector};
 use matrix_sdk::{deserialized_responses::TimelineEvent, Room};
-use ruma::{assign, events::{
-    relation::{InReplyTo, Thread},
-    room::message::{
-        MessageType, Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
-        SyncRoomMessageEvent,
+use ruma::{
+    assign,
+    events::{
+        relation::{InReplyTo, Thread},
+        room::message::{
+            MessageType, Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+            SyncRoomMessageEvent,
+        },
+        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnyTimelineEvent,
+        BundledMessageLikeRelations, Mentions,
     },
-    AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnyTimelineEvent,
-    BundledMessageLikeRelations, Mentions,
-}, html::RemoveReplyFallback, OwnedEventId, OwnedUserId, RoomVersionId, UserId};
+    html::RemoveReplyFallback,
+    OwnedEventId, OwnedUserId, RoomVersionId, UserId,
+};
 use tracing::error;
 
 use super::TimelineItemContent;
@@ -52,13 +57,7 @@ pub struct Message {
 
 impl Message {
     pub fn forwarded(msgtype: MessageType) -> Self {
-        Self {
-            msgtype,
-            in_reply_to: None,
-            thread_root: None,
-            edited: false,
-            mentions: None,
-        }
+        Self { msgtype, in_reply_to: None, thread_root: None, edited: false, mentions: None }
     }
 
     /// Construct a `Message` from a `m.room.message` event.

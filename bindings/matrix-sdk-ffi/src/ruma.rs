@@ -54,10 +54,9 @@ use tracing::info;
 use crate::{
     error::{ClientError, MediaInfoError},
     helpers::unwrap_or_clone_arc,
+    timeline::{EventTimelineItem, MessageContent},
     utils::u64_to_uint,
-    timeline::FFIMessage,
 };
-use crate::timeline::EventTimelineItem;
 
 #[derive(uniffi::Enum)]
 pub enum AuthData {
@@ -866,7 +865,9 @@ impl From<RumaPollKind> for PollKind {
 }
 
 #[uniffi::export]
-pub fn content_without_relation_from_message(message: FFIMessage) -> Result<RoomMessageEventContentWithoutRelation, ClientError> {
+pub fn content_without_relation_from_message(
+    message: MessageContent,
+) -> Result<RoomMessageEventContentWithoutRelation, ClientError> {
     let msg_type = message.msg_type.try_into().map_err(|e| ClientError::new(e))?;
     Ok(RoomMessageEventContentWithoutRelation::new(msg_type))
 }

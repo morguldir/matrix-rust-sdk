@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, fmt::Write as _, fs, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter, Write as _},
+    fs,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use as_variant::as_variant;
@@ -29,27 +34,32 @@ use matrix_sdk::{
     deserialized_responses::{ShieldState as RustShieldState, ShieldStateCode},
     Error,
 };
-use matrix_sdk_ui::timeline::{EventItemOrigin, LiveBackPaginationStatus, Profile, RepliedToEvent, TimelineDetails, TimelineEventItemId, UnsupportedEditItem};
+use matrix_sdk_ui::timeline::{
+    EventItemOrigin, LiveBackPaginationStatus, Profile, RepliedToEvent, TimelineDetails,
+    UnsupportedEditItem,
+};
 use mime::Mime;
-use ruma::{events::{
-    location::{AssetType as RumaAssetType, LocationContent, ZoomLevel},
-    poll::{
-        unstable_end::UnstablePollEndEventContent,
-        unstable_response::UnstablePollResponseEventContent,
-        unstable_start::{
-            NewUnstablePollStartEventContent, UnstablePollAnswer, UnstablePollAnswers,
-            UnstablePollStartContentBlock,
+use ruma::{
+    events::{
+        location::{AssetType as RumaAssetType, LocationContent, ZoomLevel},
+        poll::{
+            unstable_end::UnstablePollEndEventContent,
+            unstable_response::UnstablePollResponseEventContent,
+            unstable_start::{
+                NewUnstablePollStartEventContent, UnstablePollAnswer, UnstablePollAnswers,
+                UnstablePollStartContentBlock,
+            },
         },
+        receipt::ReceiptThread,
+        relation::Annotation,
+        room::message::{
+            ForwardThread, LocationMessageEventContent, MessageType, RoomMessageEventContent,
+            RoomMessageEventContentWithoutRelation,
+        },
+        AnyMessageLikeEventContent,
     },
-    receipt::ReceiptThread,
-    relation::Annotation,
-    room::message::{
-        ForwardThread, LocationMessageEventContent, MessageType,
-        RoomMessageEventContentWithoutRelation,
-    },
-    AnyMessageLikeEventContent,
-}, EventId, OwnedTransactionId, OwnedEventId, TransactionId};
-use ruma::events::room::message::RoomMessageEventContent;
+    EventId, OwnedEventId, OwnedTransactionId, TransactionId,
+};
 use tokio::{
     sync::Mutex,
     task::{AbortHandle, JoinHandle},
@@ -74,7 +84,7 @@ use crate::{
 
 mod content;
 
-pub use content::FFIMessage;
+pub use content::MessageContent;
 
 #[derive(uniffi::Object)]
 #[repr(transparent)]
@@ -421,40 +431,53 @@ impl Timeline {
 
     pub async fn send_poll_response(
         self: Arc<Self>,
-        poll_start_id: String,
+        poll_start_id: UniqueId,
         answers: Vec<String>,
     ) -> Result<(), ClientError> {
-        let poll_start_event_id =
-            EventId::parse(poll_start_id).context("Failed to parse EventId")?;
-        let poll_response_event_content =
-            UnstablePollResponseEventContent::new(answers, poll_start_event_id);
-        let event_content =
-            AnyMessageLikeEventContent::UnstablePollResponse(poll_response_event_content);
+        let poll_start_event_id = self
+            .inner
+            .item_by_unique_id(&poll_start_id.value)
+            .await
+            .and_then(|event| event.event_id().map(|id| id.to_owned()));
+        if let Some(event_id) = poll_start_event_id {
+            let poll_response_event_content =
+                UnstablePollResponseEventContent::new(answers, event_id);
+            let event_content =
+                AnyMessageLikeEventContent::UnstablePollResponse(poll_response_event_content);
 
-        if let Err(err) = self.inner.send(event_content).await {
-            error!("unable to send poll response: {err}");
+            if let Err(err) = self.inner.send(event_content).await {
+                error!("unable to send poll response: {err}");
+            }
+            Ok(())
+        } else {
+            Err(ClientError::new(format!("Event with unique id {poll_start_id} not found.")))
         }
-
-        Ok(())
     }
 
-    pub fn end_poll(
+    pub async fn end_poll(
         self: Arc<Self>,
-        poll_start_id: String,
+        poll_start_id: UniqueId,
         text: String,
     ) -> Result<(), ClientError> {
-        let poll_start_event_id =
-            EventId::parse(poll_start_id).context("Failed to parse EventId")?;
-        let poll_end_event_content = UnstablePollEndEventContent::new(text, poll_start_event_id);
-        let event_content = AnyMessageLikeEventContent::UnstablePollEnd(poll_end_event_content);
+        let poll_start_event_id = self
+            .inner
+            .item_by_unique_id(&poll_start_id.value)
+            .await
+            .and_then(|event| event.event_id().map(|id| id.to_owned()));
+        if let Some(event_id) = poll_start_event_id {
+            let poll_end_event_content = UnstablePollEndEventContent::new(text, event_id);
+            let event_content = AnyMessageLikeEventContent::UnstablePollEnd(poll_end_event_content);
 
-        RUNTIME.spawn(async move {
-            if let Err(err) = self.inner.send(event_content).await {
-                error!("unable to end poll: {err}");
-            }
-        });
+            RUNTIME.spawn(async move {
+                if let Err(err) = self.inner.send(event_content).await {
+                    error!("unable to end poll: {err}");
+                }
+            });
 
-        Ok(())
+            Ok(())
+        } else {
+            Err(ClientError::new(format!("Event with unique id {poll_start_id} not found.")))
+        }
     }
 
     pub async fn send_reply(
@@ -486,16 +509,10 @@ impl Timeline {
     /// local events that are being processed.
     pub async fn edit(
         &self,
-        id: String,
+        id: UniqueId,
         new_content: Arc<RoomMessageEventContentWithoutRelation>,
     ) -> Result<bool, ClientError> {
-        let event = if let Ok(event_id) = EventId::parse(&id) {
-            self.inner.item_by_event_id(&event_id).await
-        } else {
-            let transaction_id: OwnedTransactionId = id.into();
-            self.inner.local_item_by_transaction_id(&transaction_id).await
-        };
-        if let Some(event) = event {
+        if let Some(event) = self.inner.item_by_unique_id(&id.value).await {
             self.inner.edit(&event, (*new_content).clone()).await.map_err(ClientError::from)
         } else {
             Ok(false)
@@ -508,10 +525,9 @@ impl Timeline {
         answers: Vec<String>,
         max_selections: u8,
         poll_kind: PollKind,
-        id: String,
+        id: UniqueId,
     ) -> Result<bool, ClientError> {
-        let event_id = EventId::parse(id)?;
-        if let Some(event) = self.inner.item_by_event_id(&event_id).await {
+        if let Some(event) = self.inner.item_by_unique_id(&id.value).await {
             let poll_data = PollData { question, answers, max_selections, poll_kind };
             self.inner
                 .edit_poll(poll_data.fallback_text(), poll_data.try_into()?, &event)
@@ -616,6 +632,18 @@ impl Timeline {
         Ok(item.into())
     }
 
+    pub async fn get_event_timeline_item_by_unique_id(
+        &self,
+        unique_id: UniqueId,
+    ) -> Result<EventTimelineItem, ClientError> {
+        let item = self
+            .inner
+            .item_by_unique_id(&unique_id.value)
+            .await
+            .context("Item with given transaction ID not found")?;
+        Ok(item.into())
+    }
+
     /// Redacts an event from the timeline.
     ///
     /// Only works for events that exist as timeline items.
@@ -628,16 +656,10 @@ impl Timeline {
     /// local events that are being processed.
     pub async fn redact_event(
         &self,
-        id: String,
+        id: UniqueId,
         reason: Option<String>,
     ) -> Result<bool, ClientError> {
-        let event = if let Ok(event_id) = EventId::parse(&id) {
-            self.inner.item_by_event_id(&event_id).await
-        } else {
-            let transaction_id: OwnedTransactionId = id.into();
-            self.inner.local_item_by_transaction_id(&transaction_id).await
-        };
-        if let Some(event) = event {
+        if let Some(event) = self.inner.item_by_unique_id(&id.value).await {
             let removed = self
                 .inner
                 .redact(&event, reason.as_deref())
@@ -711,7 +733,10 @@ impl Timeline {
         self.inner.unpin_event(&event_id).await.map_err(ClientError::from)
     }
 
-    pub fn create_message_content(&self, msg_type: crate::ruma::MessageType) -> Option<Arc<RoomMessageEventContentWithoutRelation>> {
+    pub fn create_message_content(
+        &self,
+        msg_type: crate::ruma::MessageType,
+    ) -> Option<Arc<RoomMessageEventContentWithoutRelation>> {
         let msg_type: Option<MessageType> = msg_type.try_into().ok();
         msg_type.map(|m| Arc::new(RoomMessageEventContentWithoutRelation::new(m)))
     }
@@ -927,8 +952,8 @@ impl TimelineItem {
         }
     }
 
-    pub fn unique_id(&self) -> String {
-        self.0.unique_id().to_owned()
+    pub fn unique_id(&self) -> UniqueId {
+        UniqueId { value: self.0.unique_id().to_owned() }
     }
 
     pub fn fmt_debug(&self) -> String {
@@ -1072,18 +1097,6 @@ pub struct EventTimelineItem {
     message_shield: Option<ShieldState>,
 }
 
-impl EventTimelineItem {
-    pub(crate) fn identifier(&self) -> TimelineEventItemId {
-        if let Some(Ok(id)) = self.event_id.clone().map(|i| EventId::parse(&i)) {
-            TimelineEventItemId::EventId(id.clone())
-        } else if let Some(id) = self.transaction_id.clone() {
-            TimelineEventItemId::TransactionId(id.into())
-        } else {
-            panic!("EventTimelineItem has no event_id or transaction_id");
-        }
-    }
-}
-
 impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
     fn from(value: matrix_sdk_ui::timeline::EventTimelineItem) -> Self {
         let reactions = value
@@ -1105,7 +1118,8 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
             original_json: value.original_json().map(|raw| raw.json().get().to_owned()),
             latest_edit_json: value.latest_edit_json().map(|raw| raw.json().get().to_owned()),
         };
-        let read_receipts = value.read_receipts().iter().map(|(k, v)| (k.to_string(), v.clone().into())).collect();
+        let read_receipts =
+            value.read_receipts().iter().map(|(k, v)| (k.to_string(), v.clone().into())).collect();
         Self {
             is_local: value.is_local_echo(),
             is_remote: !value.is_local_echo(),
@@ -1129,7 +1143,8 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
 }
 
 // #[derive(uniffi::Object)]
-// pub struct EventTimelineItem(pub(crate) matrix_sdk_ui::timeline::EventTimelineItem);
+// pub struct EventTimelineItem(pub(crate)
+// matrix_sdk_ui::timeline::EventTimelineItem);
 //
 // #[uniffi::export]
 // impl EventTimelineItem {
@@ -1193,9 +1208,9 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
 //     pub fn debug_info(&self) -> EventTimelineItemDebugInfo {
 //         EventTimelineItemDebugInfo {
 //             model: format!("{:#?}", self.0),
-//             original_json: self.0.original_json().map(|raw| raw.json().get().to_owned()),
-//             latest_edit_json: self.0.latest_edit_json().map(|raw| raw.json().get().to_owned()),
-//         }
+//             original_json: self.0.original_json().map(|raw|
+// raw.json().get().to_owned()),             latest_edit_json:
+// self.0.latest_edit_json().map(|raw| raw.json().get().to_owned()),         }
 //     }
 //
 //     pub fn local_send_state(&self) -> Option<EventSendState> {
@@ -1203,8 +1218,8 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
 //     }
 //
 //     pub fn read_receipts(&self) -> HashMap<String, Receipt> {
-//         self.0.read_receipts().iter().map(|(k, v)| (k.to_string(), v.clone().into())).collect()
-//     }
+//         self.0.read_receipts().iter().map(|(k, v)| (k.to_string(),
+// v.clone().into())).collect()     }
 //
 //     pub fn origin(&self) -> Option<EventItemOrigin> {
 //         self.0.origin()
@@ -1214,8 +1229,8 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
 //         self.0.can_be_replied_to()
 //     }
 //
-//     /// Gets the [`ShieldState`] which can be used to decorate messages in the
-//     /// recommended way.
+//     /// Gets the [`ShieldState`] which can be used to decorate messages in
+// the     /// recommended way.
 //     pub fn get_shield(&self, strict: bool) -> Option<ShieldState> {
 //         self.0.get_shield(strict).map(Into::into)
 //     }
@@ -1245,6 +1260,17 @@ pub enum ProfileDetails {
     Pending,
     Ready { display_name: Option<String>, display_name_ambiguous: bool, avatar_url: Option<String> },
     Error { message: String },
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct UniqueId {
+    value: String,
+}
+
+impl Display for UniqueId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.value)
+    }
 }
 
 impl From<&TimelineDetails<Profile>> for ProfileDetails {
