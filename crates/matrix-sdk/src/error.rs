@@ -24,7 +24,9 @@ use matrix_sdk_base::crypto::ScanError;
 use matrix_sdk_base::crypto::{
     CryptoStoreError, DecryptorError, KeyExportError, MegolmError, OlmError,
 };
-use matrix_sdk_base::{Error as SdkBaseError, RoomState, StoreError};
+use matrix_sdk_base::{
+    event_cache_store::EventCacheStoreError, Error as SdkBaseError, RoomState, StoreError,
+};
 use reqwest::Error as ReqwestError;
 use ruma::{
     api::{
@@ -155,7 +157,8 @@ impl HttpError {
         match self {
             // If it was a plain network error, it's either that we're disconnected from the
             // internet, or that the remote is, so retry a few times.
-            HttpError::Reqwest(_) => RetryKind::Transient { retry_after: None },
+            HttpError::Reqwest(_) => RetryKind::NetworkFailure,
+
             HttpError::Api(FromHttpResponseError::Server(api_error)) => {
                 RetryKind::from_api_error(api_error)
             }
@@ -167,12 +170,20 @@ impl HttpError {
 /// How should we behave with respect to retry behavior after an [`HttpError`]
 /// happened?
 pub(crate) enum RetryKind {
+    /// The request failed because of an error at the network layer.
+    NetworkFailure,
+
+    /// The request failed with a "transient" error, meaning it could be retried
+    /// either soon, or after a given amount of time expressed in
+    /// `retry_after`.
     Transient {
         // This is used only for attempts to retry, so on non-wasm32 code (in the `native` module).
         #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
         retry_after: Option<Duration>,
     },
 
+    /// The request failed with a non-transient error, and retrying it would
+    /// likely cause the same error again, so it's not worth retrying.
     Permanent,
 }
 
@@ -303,6 +314,10 @@ pub enum Error {
     /// An error occurred in the state store.
     #[error(transparent)]
     StateStore(#[from] StoreError),
+
+    /// An error occurred in the event cache store.
+    #[error(transparent)]
+    EventCacheStore(#[from] EventCacheStoreError),
 
     /// An error encountered when trying to parse an identifier.
     #[error(transparent)]

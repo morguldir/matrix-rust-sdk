@@ -13,6 +13,9 @@
 - `Client::get_stripped_rooms` has finally been removed.
 - `Media::get_thumbnail` and `MediaFormat::Thumbnail` allow to request an animated thumbnail
   - They both take a `MediaThumbnailSettings` instead of `MediaThumbnailSize`.
+- The `StateStore` methods to access data in the media cache where moved to a separate
+  `EventCacheStore` trait.
+- The `instant` module was removed, use the `ruma::time` module instead.
 
 # 0.7.0
 

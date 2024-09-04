@@ -16,11 +16,9 @@ use ruma::UserId;
 use tracing::error;
 use vodozemac::Curve25519PublicKey;
 
-use super::{InboundGroupSession, SenderData};
+use super::{InboundGroupSession, KnownSenderData, SenderData};
 use crate::{
-    error::MismatchedIdentityKeysError,
-    store::Store,
-    types::{events::olm_v1::DecryptedRoomKeyEvent, DeviceKeys},
+    error::MismatchedIdentityKeysError, store::Store, types::events::olm_v1::DecryptedRoomKeyEvent,
     CryptoStoreError, Device, DeviceData, MegolmError, OlmError, SignatureError,
 };
 
@@ -144,14 +142,14 @@ impl<'a> SenderDataFinder<'a> {
         finder.have_event(sender_curve_key, room_key_event).await
     }
 
-    /// Use the supplied device keys to decide whether we trust the sender.
-    pub(crate) async fn find_using_device_keys(
+    /// Use the supplied device data to decide whether we trust the sender.
+    pub(crate) async fn find_using_device_data(
         store: &'a Store,
-        device_keys: DeviceKeys,
+        device_data: DeviceData,
         session: &'a InboundGroupSession,
-    ) -> Result<SenderData, SessionDeviceKeysCheckError> {
+    ) -> Result<SenderData, SessionDeviceCheckError> {
         let finder = Self { store, session };
-        finder.have_device_keys(&device_keys).await
+        finder.have_device_data(device_data).await
     }
 
     /// Find the device using the curve key provided, and decide whether we
@@ -174,8 +172,11 @@ impl<'a> SenderDataFinder<'a> {
     ) -> Result<SenderData, SessionDeviceKeysCheckError> {
         // Does the to-device message contain the device_keys property from MSC4147?
         if let Some(sender_device_keys) = &room_key_event.device_keys {
-            // Yes: use the device keys to continue
-            self.have_device_keys(sender_device_keys).await
+            // Yes: use the device keys to continue.
+
+            // Validate the signature of the DeviceKeys supplied.
+            let sender_device_data = DeviceData::try_from(sender_device_keys)?;
+            Ok(self.have_device_data(sender_device_data).await?)
         } else {
             // No: look for the device in the store
             Ok(self.search_for_device(sender_curve_key, &room_key_event.sender).await?)
@@ -213,14 +214,12 @@ impl<'a> SenderDataFinder<'a> {
         }
     }
 
-    async fn have_device_keys(
+    async fn have_device_data(
         &self,
-        sender_device_keys: &DeviceKeys,
-    ) -> Result<SenderData, SessionDeviceKeysCheckError> {
-        // Validate the signature of the DeviceKeys supplied.
-        let sender_device_data = DeviceData::try_from(sender_device_keys)?;
+        sender_device_data: DeviceData,
+    ) -> Result<SenderData, SessionDeviceCheckError> {
         let sender_device = self.store.wrap_device_data(sender_device_data).await?;
-        Ok(self.have_device(sender_device)?)
+        self.have_device(sender_device)
     }
 
     /// Step D (we have a device)
@@ -269,8 +268,18 @@ impl<'a> SenderDataFinder<'a> {
         if let Some(master_key) = master_key {
             // We have user_id and master_key for the user sending the to-device message.
             let master_key = Box::new(master_key);
-            let master_key_verified = sender_device.is_cross_signing_trusted();
-            SenderData::SenderKnown { user_id, device_id, master_key, master_key_verified }
+            let known_sender_data = KnownSenderData { user_id, device_id, master_key };
+            if sender_device.is_cross_signing_trusted() {
+                SenderData::SenderVerified(known_sender_data)
+            } else if sender_device
+                .device_owner_identity
+                .expect("User with master key must have identity")
+                .was_previously_verified()
+            {
+                SenderData::SenderUnverifiedButPreviouslyVerified(known_sender_data)
+            } else {
+                SenderData::SenderUnverified(known_sender_data)
+            }
         } else {
             // Surprisingly, there was no key in the MasterPubkey. We did not expect this:
             // treat it as if the device was not signed by this master key.
@@ -384,7 +393,7 @@ mod tests {
         error::MismatchedIdentityKeysError,
         olm::{
             group_sessions::sender_data_finder::SessionDeviceKeysCheckError, InboundGroupSession,
-            PrivateCrossSigningIdentity, SenderData,
+            KnownSenderData, PrivateCrossSigningIdentity, SenderData,
         },
         store::{Changes, CryptoStoreWrapper, MemoryStore, Store},
         types::{
@@ -520,13 +529,12 @@ mod tests {
 
         // Then we get back the information about the sender
         assert_let!(
-            SenderData::SenderKnown { user_id, device_id, master_key, master_key_verified } =
+            SenderData::SenderUnverified(KnownSenderData { user_id, device_id, master_key }) =
                 sender_data
         );
         assert_eq!(user_id, setup.sender.user_id);
         assert_eq!(device_id.unwrap(), setup.sender_device.device_id());
         assert_eq!(*master_key, setup.sender_master_key());
-        assert!(!master_key_verified);
     }
 
     #[async_test]
@@ -549,13 +557,12 @@ mod tests {
 
         // Then we get back the information about the sender
         assert_let!(
-            SenderData::SenderKnown { user_id, device_id, master_key, master_key_verified } =
+            SenderData::SenderUnverified(KnownSenderData { user_id, device_id, master_key }) =
                 sender_data
         );
         assert_eq!(user_id, setup.sender.user_id);
         assert_eq!(device_id.unwrap(), setup.sender_device.device_id());
         assert_eq!(*master_key, setup.sender_master_key());
-        assert!(!master_key_verified);
     }
 
     #[async_test]
@@ -579,13 +586,12 @@ mod tests {
 
         // Then we get back the information about the sender
         assert_let!(
-            SenderData::SenderKnown { user_id, device_id, master_key, master_key_verified } =
+            SenderData::SenderUnverified(KnownSenderData { user_id, device_id, master_key }) =
                 sender_data
         );
         assert_eq!(user_id, setup.sender.user_id);
         assert_eq!(device_id.unwrap(), setup.sender_device.device_id());
         assert_eq!(*master_key, setup.sender_master_key());
-        assert!(!master_key_verified);
     }
 
     #[async_test]
@@ -608,13 +614,12 @@ mod tests {
 
         // Then we get back the information about the sender
         assert_let!(
-            SenderData::SenderKnown { user_id, device_id, master_key, master_key_verified } =
+            SenderData::SenderUnverified(KnownSenderData { user_id, device_id, master_key }) =
                 sender_data
         );
         assert_eq!(user_id, setup.sender.user_id);
         assert_eq!(device_id.unwrap(), setup.sender_device.device_id());
         assert_eq!(*master_key, setup.sender_master_key());
-        assert!(!master_key_verified);
     }
 
     #[async_test]
@@ -712,14 +717,12 @@ mod tests {
 
         // Then we get back the information about the sender
         assert_let!(
-            SenderData::SenderKnown { user_id, device_id, master_key, master_key_verified } =
+            SenderData::SenderVerified(KnownSenderData { user_id, device_id, master_key }) =
                 sender_data
         );
         assert_eq!(user_id, setup.sender.user_id);
         assert_eq!(device_id.unwrap(), setup.sender_device.device_id());
         assert_eq!(*master_key, setup.sender_master_key());
-        // Including the fact that it was verified
-        assert!(master_key_verified);
     }
 
     #[async_test]
@@ -745,14 +748,12 @@ mod tests {
 
         // Then we get back the information about the sender
         assert_let!(
-            SenderData::SenderKnown { user_id, device_id, master_key, master_key_verified } =
+            SenderData::SenderVerified(KnownSenderData { user_id, device_id, master_key }) =
                 sender_data
         );
         assert_eq!(user_id, setup.sender.user_id);
         assert_eq!(device_id.unwrap(), setup.sender_device.device_id());
         assert_eq!(*master_key, setup.sender_master_key());
-        // Including the fact that it was verified
-        assert!(master_key_verified);
     }
 
     #[async_test]
@@ -764,18 +765,16 @@ mod tests {
         let finder = SenderDataFinder::new(&setup.store, &setup.session);
 
         // When we supply the device keys directly while asking for the sender data
-        let sender_data =
-            finder.have_device_keys(setup.sender_device.as_device_keys()).await.unwrap();
+        let sender_data = finder.have_device_data(setup.sender_device.inner.clone()).await.unwrap();
 
         // Then it is found using the device we supplied
         assert_let!(
-            SenderData::SenderKnown { user_id, device_id, master_key, master_key_verified } =
+            SenderData::SenderUnverified(KnownSenderData { user_id, device_id, master_key }) =
                 sender_data
         );
         assert_eq!(user_id, setup.sender.user_id);
         assert_eq!(device_id.unwrap(), setup.sender_device.device_id());
         assert_eq!(*master_key, setup.sender_master_key());
-        assert!(!master_key_verified);
     }
 
     struct TestOptions {

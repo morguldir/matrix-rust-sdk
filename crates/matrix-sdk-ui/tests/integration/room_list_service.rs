@@ -10,7 +10,7 @@ use matrix_sdk::{test_utils::logged_in_client_with_server, Client};
 use matrix_sdk_base::{
     sliding_sync::http::request::RoomSubscription, sync::UnreadNotificationsCount,
 };
-use matrix_sdk_test::async_test;
+use matrix_sdk_test::{async_test, mocks::mock_encryption_state};
 use matrix_sdk_ui::{
     room_list_service::{
         filters::{new_filter_fuzzy_match_room_name, new_filter_non_left, new_filter_none},
@@ -29,10 +29,7 @@ use stream_assert::{assert_next_matches, assert_pending};
 use tokio::{spawn, sync::mpsc::channel, task::yield_now};
 use wiremock::MockServer;
 
-use crate::{
-    mock_encryption_state,
-    timeline::sliding_sync::{assert_timeline_stream, timeline_event},
-};
+use crate::timeline::sliding_sync::{assert_timeline_stream, timeline_event};
 
 async fn new_room_list_service() -> Result<(Client, MockServer, RoomListService), Error> {
     let (client, server) = logged_in_client_with_server().await;
@@ -2195,16 +2192,6 @@ async fn test_room_subscription() -> Result<(), Error> {
                 },
             },
             "room_subscriptions": {
-                room_id_1: {
-                    "required_state": [
-                        ["m.room.name", ""],
-                        ["m.room.topic", ""],
-                        ["m.room.avatar", ""],
-                        ["m.room.canonical_alias", ""],
-                        ["m.room.create", ""],
-                    ],
-                    "timeline_limit": 30,
-                },
                 room_id_2: {
                     "required_state": [
                         ["m.room.name", ""],
@@ -2219,6 +2206,46 @@ async fn test_room_subscription() -> Result<(), Error> {
         },
         respond with = {
             "pos": "2",
+            "lists": {},
+            "rooms": {},
+        },
+    };
+
+    // Subscribe to an already subscribed room. Nothing happens.
+
+    room_list.subscribe_to_rooms(
+        &[room_id_1],
+        Some(assign!(RoomSubscription::default(), {
+            required_state: vec![
+                (StateEventType::RoomName, "".to_owned()),
+                (StateEventType::RoomTopic, "".to_owned()),
+                (StateEventType::RoomAvatar, "".to_owned()),
+                (StateEventType::RoomCanonicalAlias, "".to_owned()),
+            ],
+            timeline_limit: Some(uint!(30)),
+        })),
+    );
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        // strict comparison (with `=`) because we want to ensure
+        // the absence of `room_subscriptions`.
+        assert request = {
+            "conn_id": "room-list",
+            "lists": {
+                ALL_ROOMS: {
+                    "ranges": [[0, 2]],
+                },
+            },
+            // NO `room_subscriptions`!
+            "extensions": {
+                "account_data": { "enabled": true },
+                "receipts": { "enabled": true, "rooms": [ "*" ] },
+                "typing": { "enabled": true },
+            },
+        },
+        respond with = {
+            "pos": "3",
             "lists": {},
             "rooms": {},
         },

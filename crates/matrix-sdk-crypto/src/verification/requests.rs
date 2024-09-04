@@ -18,7 +18,6 @@ use as_variant::as_variant;
 use eyeball::{ObservableWriteGuard, SharedObservable, WeakObservable};
 use futures_core::Stream;
 use futures_util::StreamExt;
-use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "qrcode")]
 use matrix_sdk_qrcode::QrVerificationData;
 use ruma::{
@@ -34,6 +33,7 @@ use ruma::{
         room::message::KeyVerificationRequestEventContent,
         AnyMessageLikeEventContent, AnyToDeviceEventContent,
     },
+    time::Instant,
     to_device::DeviceIdOrAllDevices,
     DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, RoomId, TransactionId,
     UserId,
@@ -1828,7 +1828,7 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "qrcode")]
-    async fn can_scan_another_qr_after_creating_mine() {
+    async fn test_can_scan_another_qr_after_creating_mine() {
         let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests
@@ -1879,7 +1879,7 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "qrcode")]
-    async fn can_start_sas_after_generating_qr_code() {
+    async fn test_can_start_sas_after_generating_qr_code() {
         let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests
@@ -1924,7 +1924,7 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "qrcode")]
-    async fn start_sas_after_scan_cancels_request() {
+    async fn test_start_sas_after_scan_cancels_request() {
         let (_alice, alice_store, _bob, bob_store) = setup_stores().await;
 
         // Set up the pair of verification requests

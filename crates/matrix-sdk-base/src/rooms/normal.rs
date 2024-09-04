@@ -992,6 +992,23 @@ impl Room {
     }
 }
 
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+#[cfg(not(feature = "test-send-sync"))]
+unsafe impl Send for Room {}
+
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+#[cfg(not(feature = "test-send-sync"))]
+unsafe impl Sync for Room {}
+
+#[cfg(feature = "test-send-sync")]
+#[test]
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+fn test_send_sync_for_room() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<Room>();
+}
+
 /// The underlying pure data structure for joined and left rooms.
 ///
 /// Holds all the info needed to persist a room into the state store.
@@ -1659,6 +1676,7 @@ mod tests {
         ops::{Not, Sub},
         str::FromStr,
         sync::Arc,
+        time::Duration,
     };
 
     use assign::assign;
@@ -1687,12 +1705,12 @@ mod tests {
         },
         owned_event_id, room_alias_id, room_id,
         serde::Raw,
+        time::SystemTime,
         user_id, EventEncryptionAlgorithm, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId,
         UserId,
     };
     use serde_json::json;
     use stream_assert::{assert_pending, assert_ready};
-    use web_time::{Duration, SystemTime};
 
     use super::{compute_display_name_from_heroes, Room, RoomHero, RoomInfo, RoomState, SyncInfo};
     #[cfg(any(feature = "experimental-sliding-sync", feature = "e2e-encryption"))]

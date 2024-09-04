@@ -832,8 +832,7 @@ mod tests {
     #[async_test]
     #[cfg(target_os = "linux")]
     async fn test_session_unwedging() {
-        use matrix_sdk_common::instant::{Duration, SystemTime};
-        use ruma::SecondsSinceUnixEpoch;
+        use ruma::{time::SystemTime, SecondsSinceUnixEpoch};
 
         let (manager, _identity_manager) = session_manager_test_helper().await;
         let mut bob = bob_account();
@@ -893,7 +892,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn failure_handling() {
+    async fn test_failure_handling() {
         let alice = user_id!("@alice:example.org");
         let alice_account = Account::with_device_id(alice, "DEVICEID".into());
         let alice_device = DeviceData::from_account(&alice_account);
@@ -920,7 +919,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn failed_devices_handling() {
+    async fn test_failed_devices_handling() {
         // Alice is missing altogether
         test_invalid_claim_response(json!({
             "one_time_keys": {},

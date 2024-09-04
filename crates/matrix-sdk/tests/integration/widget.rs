@@ -26,7 +26,8 @@ use matrix_sdk::{
 };
 use matrix_sdk_common::{executor::spawn, timeout::timeout};
 use matrix_sdk_test::{
-    async_test, EventBuilder, JoinedRoomBuilder, SyncResponseBuilder, ALICE, BOB,
+    async_test, mocks::mock_encryption_state, EventBuilder, JoinedRoomBuilder, SyncResponseBuilder,
+    ALICE, BOB,
 };
 use once_cell::sync::Lazy;
 use ruma::{
@@ -48,7 +49,7 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
 };
 
-use crate::{logged_in_client_with_server, mock_encryption_state, mock_sync};
+use crate::{logged_in_client_with_server, mock_sync};
 
 /// Create a JSON string from a [`json!`][serde_json::json] "literal".
 #[macro_export]
@@ -143,7 +144,7 @@ async fn send_response(
 }
 
 #[async_test]
-async fn negotiate_capabilities_immediately() {
+async fn test_negotiate_capabilities_immediately() {
     let (_, _, driver_handle) = run_test_driver(false).await;
 
     let caps = json!(["org.matrix.msc2762.receive.event:m.room.message"]);
@@ -197,7 +198,7 @@ async fn negotiate_capabilities_immediately() {
 }
 
 #[async_test]
-async fn read_messages() {
+async fn test_read_messages() {
     let (_, mock_server, driver_handle) = run_test_driver(true).await;
 
     {
@@ -286,7 +287,7 @@ async fn read_messages() {
 }
 
 #[async_test]
-async fn read_messages_with_msgtype_capabilities() {
+async fn test_read_messages_with_msgtype_capabilities() {
     let (_, mock_server, driver_handle) = run_test_driver(true).await;
 
     {
@@ -383,7 +384,7 @@ async fn read_messages_with_msgtype_capabilities() {
 }
 
 #[async_test]
-async fn read_room_members() {
+async fn test_read_room_members() {
     let (_, mock_server, driver_handle) = run_test_driver(false).await;
 
     negotiate_capabilities(
@@ -421,7 +422,7 @@ async fn read_room_members() {
 }
 
 #[async_test]
-async fn receive_live_events() {
+async fn test_receive_live_events() {
     let (client, mock_server, driver_handle) = run_test_driver(false).await;
 
     negotiate_capabilities(
@@ -520,7 +521,7 @@ async fn receive_live_events() {
 }
 
 #[async_test]
-async fn send_room_message() {
+async fn test_send_room_message() {
     let (_, mock_server, driver_handle) = run_test_driver(false).await;
 
     negotiate_capabilities(&driver_handle, json!(["org.matrix.msc2762.send.event:m.room.message"]))
@@ -559,7 +560,7 @@ async fn send_room_message() {
 }
 
 #[async_test]
-async fn send_room_name() {
+async fn test_send_room_name() {
     let (_, mock_server, driver_handle) = run_test_driver(false).await;
 
     negotiate_capabilities(
@@ -601,7 +602,7 @@ async fn send_room_name() {
 }
 
 #[async_test]
-async fn send_delayed_message_event() {
+async fn test_send_delayed_message_event() {
     let (_, mock_server, driver_handle) = run_test_driver(false).await;
 
     negotiate_capabilities(
@@ -649,7 +650,7 @@ async fn send_delayed_message_event() {
 }
 
 #[async_test]
-async fn send_delayed_state_event() {
+async fn test_send_delayed_state_event() {
     let (_, mock_server, driver_handle) = run_test_driver(false).await;
 
     negotiate_capabilities(
@@ -697,7 +698,7 @@ async fn send_delayed_state_event() {
 }
 
 #[async_test]
-async fn try_send_delayed_state_event_without_permission() {
+async fn test_try_send_delayed_state_event_without_permission() {
     let (_, _mock_server, driver_handle) = run_test_driver(false).await;
 
     negotiate_capabilities(
@@ -733,7 +734,7 @@ async fn try_send_delayed_state_event_without_permission() {
 }
 
 #[async_test]
-async fn update_delayed_event() {
+async fn test_update_delayed_event() {
     let (_, mock_server, driver_handle) = run_test_driver(false).await;
 
     negotiate_capabilities(&driver_handle, json!(["org.matrix.msc4157.update_delayed_event",]))
@@ -769,7 +770,7 @@ async fn update_delayed_event() {
 }
 
 #[async_test]
-async fn try_update_delayed_event_without_permission() {
+async fn test_try_update_delayed_event_without_permission() {
     let (_, _mock_server, driver_handle) = run_test_driver(false).await;
 
     negotiate_capabilities(&driver_handle, json!([])).await;
@@ -797,7 +798,7 @@ async fn try_update_delayed_event_without_permission() {
 }
 
 #[async_test]
-async fn try_update_delayed_event_without_permission_negotiate() {
+async fn test_try_update_delayed_event_without_permission_negotiate() {
     let (_, _mock_server, driver_handle) = run_test_driver(false).await;
 
     send_request(

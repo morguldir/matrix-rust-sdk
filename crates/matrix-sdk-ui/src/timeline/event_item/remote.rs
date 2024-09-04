@@ -22,8 +22,6 @@ use ruma::{
     OwnedEventId, OwnedTransactionId, OwnedUserId,
 };
 
-use super::ReactionsByKeyBySender;
-
 /// An item for an event that was received from the homeserver.
 #[derive(Clone)]
 pub(in crate::timeline) struct RemoteEventTimelineItem {
@@ -32,9 +30,6 @@ pub(in crate::timeline) struct RemoteEventTimelineItem {
 
     /// If available, the transaction id we've used to send this event.
     pub transaction_id: Option<OwnedTransactionId>,
-
-    /// All bundled reactions about the event.
-    pub reactions: ReactionsByKeyBySender,
 
     /// All read receipts for the event.
     ///
@@ -73,20 +68,14 @@ pub(in crate::timeline) struct RemoteEventTimelineItem {
 }
 
 impl RemoteEventTimelineItem {
-    /// Clone the current event item, and update its `reactions`.
-    pub fn with_reactions(&self, reactions: ReactionsByKeyBySender) -> Self {
-        Self { reactions, ..self.clone() }
+    /// Clone the current event item, and update its `encryption_info`.
+    pub fn with_encryption_info(&self, encryption_info: Option<EncryptionInfo>) -> Self {
+        Self { encryption_info, ..self.clone() }
     }
 
-    /// Clone the current event item, and clear its `reactions` as well as the
-    /// JSON representation fields.
+    /// Clone the current event item, and redacts its fields.
     pub fn redact(&self) -> Self {
-        Self {
-            reactions: ReactionsByKeyBySender::default(),
-            original_json: None,
-            latest_edit_json: None,
-            ..self.clone()
-        }
+        Self { original_json: None, latest_edit_json: None, ..self.clone() }
     }
 }
 
@@ -111,7 +100,6 @@ impl fmt::Debug for RemoteEventTimelineItem {
         let Self {
             event_id,
             transaction_id,
-            reactions,
             read_receipts,
             is_own,
             encryption_info,
@@ -124,7 +112,6 @@ impl fmt::Debug for RemoteEventTimelineItem {
         f.debug_struct("RemoteEventTimelineItem")
             .field("event_id", event_id)
             .field("transaction_id", transaction_id)
-            .field("reactions", reactions)
             .field("read_receipts", read_receipts)
             .field("is_own", is_own)
             .field("is_highlighted", is_highlighted)

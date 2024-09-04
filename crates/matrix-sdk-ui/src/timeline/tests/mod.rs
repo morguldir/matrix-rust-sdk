@@ -16,14 +16,13 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::ready,
     sync::Arc,
 };
 
-use assert_matches2::assert_let;
-use async_trait::async_trait;
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
-use futures_util::{FutureExt, StreamExt};
+use futures_util::FutureExt as _;
 use indexmap::IndexMap;
 use matrix_sdk::{
     config::RequestConfig,
@@ -32,12 +31,14 @@ use matrix_sdk::{
     room::{EventWithContextResponse, Messages, MessagesOptions},
     send_queue::RoomSendQueueUpdate,
     test_utils::events::EventFactory,
+    BoxFuture,
 };
 use matrix_sdk_base::latest_event::LatestEvent;
 use matrix_sdk_test::{EventBuilder, ALICE, BOB};
 use ruma::{
     event_id,
     events::{
+        reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         relation::Annotation,
         AnyMessageLikeEventContent, AnyTimelineEvent, EmptyStateKey,
@@ -51,14 +52,14 @@ use ruma::{
     uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
     RoomVersionId, TransactionId, UInt, UserId,
 };
+use tokio::sync::RwLock;
 
 use super::{
+    controller::{TimelineEnd, TimelineSettings},
     event_handler::TimelineEventKind,
     event_item::RemoteEventOrigin,
-    inner::{TimelineEnd, TimelineInnerSettings},
-    reactions::{ReactionAction, ReactionToggleResult},
     traits::RoomDataProvider,
-    EventTimelineItem, Profile, TimelineFocus, TimelineInner, TimelineItem,
+    EventTimelineItem, Profile, TimelineController, TimelineFocus, TimelineItem,
 };
 use crate::{
     timeline::pinned_events_loader::PinnedEventsRoom, unable_to_decrypt_hook::UtdHookManager,
@@ -79,7 +80,7 @@ mod shields;
 mod virt;
 
 struct TestTimeline {
-    inner: TimelineInner<TestRoomDataProvider>,
+    controller: TimelineController<TestRoomDataProvider>,
     event_builder: EventBuilder,
     /// An [`EventFactory`] that can be used for creating events in this
     /// timeline.
@@ -91,9 +92,14 @@ impl TestTimeline {
         Self::with_room_data_provider(TestRoomDataProvider::default())
     }
 
+    /// Returns the associated inner data from that [`TestTimeline`].
+    fn data(&self) -> &TestRoomDataProvider {
+        &self.controller.room_data_provider
+    }
+
     fn with_internal_id_prefix(prefix: String) -> Self {
         Self {
-            inner: TimelineInner::new(
+            controller: TimelineController::new(
                 TestRoomDataProvider::default(),
                 TimelineFocus::Live,
                 Some(prefix),
@@ -107,7 +113,13 @@ impl TestTimeline {
 
     fn with_room_data_provider(room_data_provider: TestRoomDataProvider) -> Self {
         Self {
-            inner: TimelineInner::new(room_data_provider, TimelineFocus::Live, None, None, false),
+            controller: TimelineController::new(
+                room_data_provider,
+                TimelineFocus::Live,
+                None,
+                None,
+                false,
+            ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
         }
@@ -115,7 +127,7 @@ impl TestTimeline {
 
     fn with_unable_to_decrypt_hook(hook: Arc<UtdHookManager>) -> Self {
         Self {
-            inner: TimelineInner::new(
+            controller: TimelineController::new(
                 TestRoomDataProvider::default(),
                 TimelineFocus::Live,
                 None,
@@ -130,7 +142,7 @@ impl TestTimeline {
     // TODO: this is wrong, see also #3850.
     fn with_is_room_encrypted(encrypted: bool) -> Self {
         Self {
-            inner: TimelineInner::new(
+            controller: TimelineController::new(
                 TestRoomDataProvider::default(),
                 TimelineFocus::Live,
                 None,
@@ -142,26 +154,26 @@ impl TestTimeline {
         }
     }
 
-    fn with_settings(mut self, settings: TimelineInnerSettings) -> Self {
-        self.inner = self.inner.with_settings(settings);
+    fn with_settings(mut self, settings: TimelineSettings) -> Self {
+        self.controller = self.controller.with_settings(settings);
         self
     }
 
     async fn subscribe(&self) -> impl Stream<Item = VectorDiff<Arc<TimelineItem>>> {
-        let (items, stream) = self.inner.subscribe().await;
+        let (items, stream) = self.controller.subscribe().await;
         assert_eq!(items.len(), 0, "Please subscribe to TestTimeline before adding items to it");
         stream
     }
 
     async fn subscribe_events(&self) -> impl Stream<Item = VectorDiff<EventTimelineItem>> {
         let (items, stream) =
-            self.inner.subscribe_filter_map(|item| item.as_event().cloned()).await;
+            self.controller.subscribe_filter_map(|item| item.as_event().cloned()).await;
         assert_eq!(items.len(), 0, "Please subscribe to TestTimeline before adding items to it");
         stream
     }
 
     async fn len(&self) -> usize {
-        self.inner.items().await.len()
+        self.controller.items().await.len()
     }
 
     async fn handle_live_redacted_message_event<C>(&self, sender: &UserId, content: C)
@@ -221,12 +233,14 @@ impl TestTimeline {
 
     async fn handle_live_event(&self, event: impl Into<SyncTimelineEvent>) {
         let event = event.into();
-        self.inner.add_events_at(vec![event], TimelineEnd::Back, RemoteEventOrigin::Sync).await;
+        self.controller
+            .add_events_at(vec![event], TimelineEnd::Back, RemoteEventOrigin::Sync)
+            .await;
     }
 
     async fn handle_local_event(&self, content: AnyMessageLikeEventContent) -> OwnedTransactionId {
         let txn_id = TransactionId::new();
-        self.inner
+        self.controller
             .handle_local_event(
                 txn_id.clone(),
                 TimelineEventKind::Message { content, relations: Default::default() },
@@ -236,21 +250,9 @@ impl TestTimeline {
         txn_id
     }
 
-    async fn handle_local_redaction_event(&self, redacts: &EventId) -> OwnedTransactionId {
-        let txn_id = TransactionId::new();
-        self.inner
-            .handle_local_event(
-                txn_id.clone(),
-                TimelineEventKind::Redaction { redacts: redacts.to_owned() },
-                None,
-            )
-            .await;
-        txn_id
-    }
-
     async fn handle_back_paginated_event(&self, event: Raw<AnyTimelineEvent>) {
         let timeline_event = TimelineEvent::new(event.cast());
-        self.inner
+        self.controller
             .add_events_at(vec![timeline_event], TimelineEnd::Front, RemoteEventOrigin::Pagination)
             .await;
     }
@@ -260,26 +262,33 @@ impl TestTimeline {
         receipts: impl IntoIterator<Item = (OwnedEventId, ReceiptType, OwnedUserId, ReceiptThread)>,
     ) {
         let ev_content = self.event_builder.make_receipt_event_content(receipts);
-        self.inner.handle_read_receipts(ev_content).await;
+        self.controller.handle_read_receipts(ev_content).await;
     }
 
-    async fn toggle_reaction_local(
-        &self,
-        annotation: &Annotation,
-    ) -> Result<ReactionAction, super::Error> {
-        self.inner.toggle_reaction_local(annotation).await
-    }
-
-    async fn handle_reaction_response(
-        &self,
-        annotation: &Annotation,
-        result: &ReactionToggleResult,
-    ) -> Result<ReactionAction, super::Error> {
-        self.inner.resolve_reaction_response(annotation, result).await
+    async fn toggle_reaction_local(&self, unique_id: &str, key: &str) -> Result<(), super::Error> {
+        if self.controller.toggle_reaction_local(unique_id, key).await? {
+            // TODO(bnjbvr): hacky?
+            if let Some(event_id) = self
+                .controller
+                .items()
+                .await
+                .iter()
+                .rfind(|item| item.unique_id() == unique_id)
+                .and_then(|item| item.as_event()?.as_remote())
+                .map(|event_item| event_item.event_id.clone())
+            {
+                // Fake a local echo, for new reactions.
+                self.handle_local_event(
+                    ReactionEventContent::new(Annotation::new(event_id, key.to_owned())).into(),
+                )
+                .await;
+            }
+        }
+        Ok(())
     }
 
     async fn handle_room_send_queue_update(&self, update: RoomSendQueueUpdate) {
-        self.inner.handle_room_send_queue_update(update).await
+        self.controller.handle_room_send_queue_update(update).await
     }
 }
 
@@ -288,8 +297,21 @@ type ReadReceiptMap =
 
 #[derive(Clone, Default)]
 struct TestRoomDataProvider {
+    /// The initial list of user receipts for that room.
+    ///
+    /// Configurable at construction, static for the lifetime of the provider.
     initial_user_receipts: ReadReceiptMap,
+
+    /// Event id of the event pointed to by the fully read marker.
+    ///
+    /// Configurable at construction, static for the lifetime of the provider.
     fully_read_marker: Option<OwnedEventId>,
+
+    /// Events sent with that room data provider.
+    pub sent_events: Arc<RwLock<Vec<AnyMessageLikeEventContent>>>,
+
+    /// Events redacted with that room data providier.
+    pub redacted: Arc<RwLock<Vec<OwnedEventId>>>,
 }
 
 impl TestRoomDataProvider {
@@ -303,8 +325,6 @@ impl TestRoomDataProvider {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl PaginableRoom for TestRoomDataProvider {
     async fn event_with_context(
         &self,
@@ -320,14 +340,12 @@ impl PaginableRoom for TestRoomDataProvider {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl PinnedEventsRoom for TestRoomDataProvider {
-    async fn load_event(
-        &self,
-        _event_id: &EventId,
-        _config: Option<RequestConfig>,
-    ) -> Result<SyncTimelineEvent, PaginatorError> {
+    fn load_event_with_relations<'a>(
+        &'a self,
+        _event_id: &'a EventId,
+        _request_config: Option<RequestConfig>,
+    ) -> BoxFuture<'a, Result<(SyncTimelineEvent, Vec<SyncTimelineEvent>), PaginatorError>> {
         unimplemented!();
     }
 
@@ -340,7 +358,6 @@ impl PinnedEventsRoom for TestRoomDataProvider {
     }
 }
 
-#[async_trait]
 impl RoomDataProvider for TestRoomDataProvider {
     fn own_user_id(&self) -> &UserId {
         &ALICE
@@ -350,36 +367,43 @@ impl RoomDataProvider for TestRoomDataProvider {
         RoomVersionId::V10
     }
 
-    async fn profile_from_user_id(&self, _user_id: &UserId) -> Option<Profile> {
+    fn profile_from_user_id<'a>(&'a self, _user_id: &'a UserId) -> BoxFuture<'a, Option<Profile>> {
+        ready(None).boxed()
+    }
+
+    fn profile_from_latest_event(&self, _latest_event: &LatestEvent) -> Option<Profile> {
         None
     }
 
-    async fn profile_from_latest_event(&self, _latest_event: &LatestEvent) -> Option<Profile> {
-        None
-    }
-
-    async fn load_user_receipt(
+    fn load_user_receipt(
         &self,
         receipt_type: ReceiptType,
         thread: ReceiptThread,
         user_id: &UserId,
-    ) -> Option<(OwnedEventId, Receipt)> {
-        self.initial_user_receipts
-            .get(&receipt_type)
-            .and_then(|thread_map| thread_map.get(&thread))
-            .and_then(|user_map| user_map.get(user_id))
-            .cloned()
+    ) -> BoxFuture<'_, Option<(OwnedEventId, Receipt)>> {
+        ready(
+            self.initial_user_receipts
+                .get(&receipt_type)
+                .and_then(|thread_map| thread_map.get(&thread))
+                .and_then(|user_map| user_map.get(user_id))
+                .cloned(),
+        )
+        .boxed()
     }
 
-    async fn load_event_receipts(&self, event_id: &EventId) -> IndexMap<OwnedUserId, Receipt> {
-        if event_id == event_id!("$event_with_bob_receipt") {
+    fn load_event_receipts(
+        &self,
+        event_id: &EventId,
+    ) -> BoxFuture<'_, IndexMap<OwnedUserId, Receipt>> {
+        ready(if event_id == event_id!("$event_with_bob_receipt") {
             [(BOB.to_owned(), Receipt::new(MilliSecondsSinceUnixEpoch(uint!(10))))].into()
         } else {
             IndexMap::new()
-        }
+        })
+        .boxed()
     }
 
-    async fn push_rules_and_context(&self) -> Option<(Ruleset, PushConditionRoomCtx)> {
+    fn push_rules_and_context(&self) -> BoxFuture<'_, Option<(Ruleset, PushConditionRoomCtx)>> {
         let push_rules = Ruleset::server_default(&ALICE);
         let power_levels = PushConditionPowerLevelsCtx {
             users: BTreeMap::new(),
@@ -394,28 +418,31 @@ impl RoomDataProvider for TestRoomDataProvider {
             power_levels: Some(power_levels),
         };
 
-        Some((push_rules, push_context))
+        ready(Some((push_rules, push_context))).boxed()
     }
 
-    async fn load_fully_read_marker(&self) -> Option<OwnedEventId> {
-        self.fully_read_marker.clone()
+    fn load_fully_read_marker(&self) -> BoxFuture<'_, Option<OwnedEventId>> {
+        ready(self.fully_read_marker.clone()).boxed()
     }
-}
 
-pub(super) async fn assert_event_is_updated(
-    stream: &mut (impl Stream<Item = VectorDiff<Arc<TimelineItem>>> + Unpin),
-    event_id: &EventId,
-    index: usize,
-) -> EventTimelineItem {
-    assert_let!(Some(VectorDiff::Set { index: i, value: event }) = stream.next().await);
-    assert_eq!(i, index);
-    let event = event.as_event().unwrap();
-    assert_eq!(event.event_id().unwrap(), event_id);
-    event.to_owned()
-}
+    fn send(&self, content: AnyMessageLikeEventContent) -> BoxFuture<'_, Result<(), super::Error>> {
+        async move {
+            self.sent_events.write().await.push(content);
+            Ok(())
+        }
+        .boxed()
+    }
 
-pub(super) async fn assert_no_more_updates(
-    stream: &mut (impl Stream<Item = VectorDiff<Arc<TimelineItem>>> + Unpin),
-) {
-    assert!(stream.next().now_or_never().is_none())
+    fn redact<'a>(
+        &'a self,
+        event_id: &'a EventId,
+        _reason: Option<&'a str>,
+        _transaction_id: Option<OwnedTransactionId>,
+    ) -> BoxFuture<'a, Result<(), super::Error>> {
+        async move {
+            self.redacted.write().await.push(event_id.to_owned());
+            Ok(())
+        }
+        .boxed()
+    }
 }

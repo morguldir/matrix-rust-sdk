@@ -19,16 +19,12 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use assign::assign;
 use eyeball_im::{Vector, VectorDiff};
-use futures_core::Stream;
-use futures_util::{future::join_all, FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt};
 use matrix_sdk::ruma::{
     api::client::room::create_room::v3::Request as CreateRoomRequest,
-    events::{relation::Annotation, room::message::RoomMessageEventContent},
-    EventId, MilliSecondsSinceUnixEpoch, UserId,
+    events::room::message::RoomMessageEventContent, MilliSecondsSinceUnixEpoch,
 };
-use matrix_sdk_ui::timeline::{
-    EventSendState, EventTimelineItem, RoomExt, TimelineEventItemId, TimelineItem,
-};
+use matrix_sdk_ui::timeline::{EventSendState, ReactionStatus, RoomExt, TimelineItem};
 use tokio::{
     spawn,
     task::JoinHandle,
@@ -37,6 +33,24 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::helpers::TestClientBuilder;
+
+/// Checks that there a timeline update, and returns the EventTimelineItem.
+///
+/// A macro to help lowering compile times and getting better error locations.
+macro_rules! assert_event_is_updated {
+    ($stream:expr, $event_id:expr, $index:expr) => {{
+        assert_let!(
+            Ok(Some(VectorDiff::Set { index: i, value: event })) =
+                timeout(Duration::from_secs(1), $stream.next()).await
+        );
+        assert_eq!(i, $index, "unexpected position for event update, value = {event:?}");
+
+        let event = event.as_event().unwrap();
+        assert_eq!(event.event_id().unwrap(), $event_id);
+
+        event.to_owned()
+    }};
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_toggling_reaction() -> Result<()> {
@@ -70,15 +84,17 @@ async fn test_toggling_reaction() -> Result<()> {
             items.iter().find_map(|item| {
                 let event = item.as_event()?;
                 if !event.is_local_echo() && event.content().as_message()?.body().trim() == "hi!" {
-                    event.event_id().map(|event_id| event_id.to_owned())
+                    event
+                        .event_id()
+                        .map(|event_id| (item.unique_id().to_owned(), event_id.to_owned()))
                 } else {
                     None
                 }
             })
         };
 
-        if let Some(event_id) = find_event_id(&items) {
-            return Ok(event_id);
+        if let Some(pair) = find_event_id(&items) {
+            return Ok(pair);
         }
 
         warn!(?items, "Waiting for updates…");
@@ -86,8 +102,8 @@ async fn test_toggling_reaction() -> Result<()> {
         while let Some(diff) = stream.next().await {
             warn!(?diff, "received a diff");
             diff.apply(&mut items);
-            if let Some(event_id) = find_event_id(&items) {
-                return Ok(event_id);
+            if let Some(pair) = find_event_id(&items) {
+                return Ok(pair);
             }
         }
 
@@ -96,13 +112,13 @@ async fn test_toggling_reaction() -> Result<()> {
 
     // Create a timeline for this room.
     debug!("Creating timeline…");
-    let timeline = room.timeline().await.unwrap();
+    let timeline = Arc::new(room.timeline().await.unwrap());
 
     // Send message.
     debug!("Sending initial message…");
     timeline.send(RoomMessageEventContent::text_plain("hi!").into()).await.unwrap();
 
-    let event_id = timeout(Duration::from_secs(10), event_id_task)
+    let (msg_uid, event_id) = timeout(Duration::from_secs(10), event_id_task)
         .await
         .expect("timeout")
         .expect("failed to join tokio task")
@@ -128,128 +144,54 @@ async fn test_toggling_reaction() -> Result<()> {
         .find_map(|(i, item)| (item.as_event()?.event_id()? == event_id).then_some(i))
         .expect("couldn't find the final position for the event id");
 
-    let reaction = Annotation::new(event_id.clone(), "👍".to_owned());
+    let reaction_key = "👍".to_owned();
 
     // Toggle reaction multiple times.
-    let all_tests = async move {
-        for _ in 0..3 {
-            debug!("Starting the toggle reaction tests…");
+    for _ in 0..3 {
+        debug!("Starting the toggle reaction tests…");
 
-            // Add
-            timeline.toggle_reaction(&reaction).await.expect("toggling reaction");
-            assert_local_added(&mut stream, &user_id, &event_id, &reaction, message_position).await;
-            assert_remote_added(&mut stream, &user_id, &event_id, &reaction, message_position)
-                .await;
+        // Add the reaction.
+        timeline.toggle_reaction(&msg_uid, &reaction_key).await.expect("toggling reaction");
 
-            // Redact
-            timeline.toggle_reaction(&reaction).await.expect("toggling reaction the second time");
-            assert_redacted(&mut stream, &event_id, message_position).await;
-
-            // Add, redact, add, redact, add
-            join_all((0..5).map(|_| timeline.toggle_reaction(&reaction)).collect::<Vec<_>>()).await;
-            assert_local_added(&mut stream, &user_id, &event_id, &reaction, message_position).await;
-            assert_redacted(&mut stream, &event_id, message_position).await;
-            assert_local_added(&mut stream, &user_id, &event_id, &reaction, message_position).await;
-            assert_redacted(&mut stream, &event_id, message_position).await;
-            assert_local_added(&mut stream, &user_id, &event_id, &reaction, message_position).await;
-            assert_remote_added(&mut stream, &user_id, &event_id, &reaction, message_position)
-                .await;
-
-            // Redact, add, redact, add
-            join_all((0..4).map(|_| timeline.toggle_reaction(&reaction)).collect::<Vec<_>>()).await;
-            assert_redacted(&mut stream, &event_id, message_position).await;
-            assert_local_added(&mut stream, &user_id, &event_id, &reaction, message_position).await;
-            assert_redacted(&mut stream, &event_id, message_position).await;
-            assert_local_added(&mut stream, &user_id, &event_id, &reaction, message_position).await;
-            assert_remote_added(&mut stream, &user_id, &event_id, &reaction, message_position)
-                .await;
-
-            // Redact, add, redact, add, redact
-            join_all((0..5).map(|_| timeline.toggle_reaction(&reaction)).collect::<Vec<_>>()).await;
-            assert_redacted(&mut stream, &event_id, message_position).await;
-            assert_local_added(&mut stream, &user_id, &event_id, &reaction, message_position).await;
-            assert_redacted(&mut stream, &event_id, message_position).await;
-            assert_local_added(&mut stream, &user_id, &event_id, &reaction, message_position).await;
-            assert_redacted(&mut stream, &event_id, message_position).await;
-
-            // Add, redact, add, redact
-            join_all((0..4).map(|_| timeline.toggle_reaction(&reaction)).collect::<Vec<_>>()).await;
-            assert_local_added(&mut stream, &user_id, &event_id, &reaction, message_position).await;
-            assert_redacted(&mut stream, &event_id, message_position).await;
-            assert_local_added(&mut stream, &user_id, &event_id, &reaction, message_position).await;
-            assert_redacted(&mut stream, &event_id, message_position).await;
+        // Local echo is added.
+        {
+            let event = assert_event_is_updated!(stream, event_id, message_position);
+            let reactions = event.reactions().get(&reaction_key).unwrap();
+            let reaction = reactions.get(&user_id).unwrap();
+            assert_matches!(reaction.status, ReactionStatus::LocalToRemote(..));
         }
-    };
 
-    timeout(Duration::from_secs(10), all_tests).await.expect("timed out");
+        // Remote echo is added.
+        {
+            let event = assert_event_is_updated!(stream, event_id, message_position);
+
+            let reactions = event.reactions().get(&reaction_key).unwrap();
+            assert_eq!(reactions.keys().count(), 1);
+
+            let reaction = reactions.get(&user_id).unwrap();
+            assert_matches!(reaction.status, ReactionStatus::RemoteToRemote(..));
+
+            // Remote event should have a timestamp <= than now.
+            // Note: this can actually be equal because if the timestamp from
+            // server is not available, it might be created with a local call to `now()`
+            assert!(reaction.timestamp <= MilliSecondsSinceUnixEpoch::now());
+            assert!(stream.next().now_or_never().is_none());
+        }
+
+        // Redact the reaction.
+        timeline
+            .toggle_reaction(&msg_uid, &reaction_key)
+            .await
+            .expect("toggling reaction the second time");
+
+        // The reaction is removed.
+        let event = assert_event_is_updated!(stream, event_id, message_position);
+        assert!(event.reactions().is_empty());
+
+        assert!(stream.next().now_or_never().is_none());
+    }
 
     Ok(())
-}
-
-async fn assert_local_added(
-    stream: &mut (impl Stream<Item = VectorDiff<Arc<TimelineItem>>> + Unpin),
-    user_id: &UserId,
-    event_id: &EventId,
-    reaction: &Annotation,
-    message_position: usize,
-) {
-    let event = assert_event_is_updated(stream, event_id, message_position).await;
-
-    let (reaction_tx_id, reaction_event_id) = {
-        let reactions = event.reactions().get(&reaction.key).unwrap();
-        let reaction = reactions.get(user_id).unwrap();
-        match &reaction.id {
-            TimelineEventItemId::TransactionId(txn_id) => (Some(txn_id), None),
-            TimelineEventItemId::EventId(event_id) => (None, Some(event_id)),
-        }
-    };
-    assert_matches!(reaction_tx_id, Some(_));
-    // Event ID hasn't been received from homeserver yet
-    assert_matches!(reaction_event_id, None);
-}
-
-async fn assert_redacted(
-    stream: &mut (impl Stream<Item = VectorDiff<Arc<TimelineItem>>> + Unpin),
-    event_id: &EventId,
-    message_position: usize,
-) {
-    let event = assert_event_is_updated(stream, event_id, message_position).await;
-    assert!(event.reactions().is_empty());
-}
-
-async fn assert_remote_added(
-    stream: &mut (impl Stream<Item = VectorDiff<Arc<TimelineItem>>> + Unpin),
-    user_id: &UserId,
-    event_id: &EventId,
-    reaction: &Annotation,
-    message_position: usize,
-) {
-    let event = assert_event_is_updated(stream, event_id, message_position).await;
-
-    let reactions = event.reactions().get(&reaction.key).unwrap();
-    assert_eq!(reactions.keys().count(), 1);
-
-    let reaction = reactions.get(user_id).unwrap();
-    assert_matches!(reaction.id, TimelineEventItemId::EventId(..));
-
-    // Remote event should have a timestamp <= than now.
-    // Note: this can actually be equal because if the timestamp from
-    // server is not available, it might be created with a local call to `now()`
-    assert!(reaction.timestamp <= MilliSecondsSinceUnixEpoch::now());
-}
-
-async fn assert_event_is_updated(
-    stream: &mut (impl Stream<Item = VectorDiff<Arc<TimelineItem>>> + Unpin),
-    event_id: &EventId,
-    index: usize,
-) -> EventTimelineItem {
-    assert_let!(Some(VectorDiff::Set { index: i, value: event }) = stream.next().await);
-    assert_eq!(i, index, "unexpected position for event update, value = {event:?}");
-
-    let event = event.as_event().unwrap();
-    assert_eq!(event.event_id().unwrap(), event_id);
-
-    event.to_owned()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

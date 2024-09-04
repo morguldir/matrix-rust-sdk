@@ -27,6 +27,11 @@ experimental-sliding-sync = [
 ]
 uniffi = ["dep:uniffi", "matrix-sdk-crypto?/uniffi", "matrix-sdk-common/uniffi"]
 
+# Private feature, see
+# https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823 for the gory
+# details.
+test-send-sync = []
+
 # "message-ids" feature doesn't do anything and is deprecated.
 message-ids = []
 
@@ -71,7 +76,6 @@ futures-executor = { workspace = true }
 http = { workspace = true }
 matrix-sdk-test = { workspace = true }
 stream_assert = { workspace = true }
-web-time = "1.1.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

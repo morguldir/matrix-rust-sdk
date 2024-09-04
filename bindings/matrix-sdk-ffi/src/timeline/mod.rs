@@ -19,6 +19,8 @@ use as_variant::as_variant;
 use content::{InReplyToDetails, RepliedToEventDetails};
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt as _};
+#[cfg(doc)]
+use matrix_sdk::crypto::CollectStrategy;
 use matrix_sdk::{
     attachment::{
         AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
@@ -56,6 +58,8 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use self::content::{Reaction, ReactionSenderData, TimelineItemContent};
+#[cfg(doc)]
+use crate::client_builder::ClientBuilder;
 use crate::{
     client::ProgressWatcher,
     error::{ClientError, RoomError},
@@ -532,9 +536,21 @@ impl Timeline {
         let _ = self.send(Arc::new(room_message_event_content)).await;
     }
 
-    pub async fn toggle_reaction(&self, event_id: String, key: String) -> Result<(), ClientError> {
-        let event_id = EventId::parse(event_id)?;
-        self.inner.toggle_reaction(&Annotation::new(event_id, key)).await?;
+    /// Toggle a reaction on an event.
+    ///
+    /// The `unique_id` parameter is a string returned by
+    /// the `TimelineItem::unique_id()` method. As such, this method works both
+    /// on local echoes and remote items.
+    ///
+    /// Adds or redacts a reaction based on the state of the reaction at the
+    /// time it is called.
+    ///
+    /// When redacting a previous reaction, the redaction reason is not set.
+    ///
+    /// Ensures that only one reaction is sent at a time to avoid race
+    /// conditions and spamming the homeserver with requests.
+    pub async fn toggle_reaction(&self, unique_id: String, key: String) -> Result<(), ClientError> {
+        self.inner.toggle_reaction(&unique_id, &key).await?;
         Ok(())
     }
 
@@ -826,6 +842,10 @@ impl TimelineDiff {
         let this = unwrap_or_clone_arc(self);
         as_variant!(this, Self::Reset { values } => values)
     }
+
+    pub fn truncate(&self) -> Option<u32> {
+        as_variant!(self, Self::Truncate { length } => (*length).try_into().unwrap())
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -896,6 +916,29 @@ impl TimelineItem {
 pub enum EventSendState {
     /// The local event has not been sent yet.
     NotSentYet,
+
+    /// One or more verified users in the room has an unsigned device.
+    ///
+    /// Happens only when the room key recipient strategy (as set by
+    /// [`ClientBuilder::room_key_recipient_strategy`]) has
+    /// [`error_on_verified_user_problem`](CollectStrategy::DeviceBasedStrategy::error_on_verified_user_problem) set.
+    VerifiedUserHasUnsignedDevice {
+        /// The unsigned devices belonging to verified users. A map from user ID
+        /// to a list of device IDs.
+        devices: HashMap<String, Vec<String>>,
+    },
+
+    /// One or more verified users in the room has changed identity since they
+    /// were verified.
+    ///
+    /// Happens only when the room key recipient strategy (as set by
+    /// [`ClientBuilder::room_key_recipient_strategy`]) has
+    /// [`error_on_verified_user_problem`](CollectStrategy::DeviceBasedStrategy::error_on_verified_user_problem) set.
+    VerifiedUserChangedIdentity {
+        /// The users that were previously verified, but are no longer
+        users: Vec<String>,
+    },
+
     /// The local event has been sent to the server, but unsuccessfully: The
     /// sending has failed.
     SendingFailed {
@@ -919,10 +962,39 @@ impl From<&matrix_sdk_ui::timeline::EventSendState> for EventSendState {
         match value {
             NotSentYet => Self::NotSentYet,
             SendingFailed { error, is_recoverable } => {
-                Self::SendingFailed { error: error.to_string(), is_recoverable: *is_recoverable }
+                event_send_state_from_sending_failed(error, *is_recoverable)
             }
             Sent { event_id } => Self::Sent { event_id: event_id.to_string() },
         }
+    }
+}
+
+fn event_send_state_from_sending_failed(error: &Error, is_recoverable: bool) -> EventSendState {
+    use matrix_sdk::crypto::{OlmError, SessionRecipientCollectionError::*};
+
+    match error {
+        // Special-case the SessionRecipientCollectionErrors, to pass the information they contain
+        // back to the application.
+        Error::OlmError(OlmError::SessionRecipientCollectionError(error)) => match error {
+            VerifiedUserHasUnsignedDevice(devices) => {
+                let devices = devices
+                    .iter()
+                    .map(|(user_id, devices)| {
+                        (
+                            user_id.to_string(),
+                            devices.iter().map(|device_id| device_id.to_string()).collect(),
+                        )
+                    })
+                    .collect();
+                EventSendState::VerifiedUserHasUnsignedDevice { devices }
+            }
+
+            VerifiedUserChangedIdentity(bad_users) => EventSendState::VerifiedUserChangedIdentity {
+                users: bad_users.iter().map(|user_id| user_id.to_string()).collect(),
+            },
+        },
+
+        _ => EventSendState::SendingFailed { error: error.to_string(), is_recoverable },
     }
 }
 

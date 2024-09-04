@@ -20,30 +20,28 @@ use matrix_sdk_base::deserialized_responses::TimelineEvent;
 #[cfg(test)]
 use ruma::events::receipt::ReceiptEventContent;
 use ruma::{
-    events::{relation::Annotation, AnySyncEphemeralRoomEvent},
-    push::Action,
-    serde::Raw,
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
-    RoomVersionId, UserId,
+    events::AnySyncEphemeralRoomEvent, push::Action, serde::Raw, EventId,
+    MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId,
+    UserId,
 };
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, instrument, trace, warn};
 
-use super::{HandleManyEventsResult, TimelineInnerSettings};
+use super::{HandleManyEventsResult, TimelineFocusKind, TimelineSettings};
 use crate::{
     events::SyncTimelineEventWithoutContent,
     timeline::{
         day_dividers::DayDividerAdjuster,
         event_handler::{
-            Flow, HandleEventResult, LiveTimelineUpdatesAllowed, TimelineEventContext,
-            TimelineEventHandler, TimelineEventKind, TimelineItemPosition,
+            Flow, HandleEventResult, TimelineEventContext, TimelineEventHandler, TimelineEventKind,
+            TimelineItemPosition,
         },
-        event_item::{ReactionInfo, RemoteEventOrigin, TimelineEventItemId},
+        event_item::RemoteEventOrigin,
         polls::PollPendingEvents,
-        reactions::{FullReactionKey, ReactionToggleResult, Reactions},
+        reactions::Reactions,
         read_receipts::ReadReceipts,
         traits::RoomDataProvider,
-        util::{rfind_event_by_id, rfind_event_item, RelativePosition},
-        Error as TimelineError, Profile, TimelineItem, TimelineItemKind,
+        util::{rfind_event_by_id, RelativePosition},
+        Profile, TimelineItem, TimelineItemKind,
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
@@ -61,18 +59,18 @@ pub(crate) enum TimelineEnd {
 }
 
 #[derive(Debug)]
-pub(in crate::timeline) struct TimelineInnerState {
+pub(in crate::timeline) struct TimelineState {
     pub items: ObservableVector<Arc<TimelineItem>>,
-    pub meta: TimelineInnerMetadata,
+    pub meta: TimelineMetadata,
 
-    /// Which timeline live updates are allowed.
-    pub live_timeline_updates_type: LiveTimelineUpdatesAllowed,
+    /// The kind of focus of this timeline.
+    timeline_focus: TimelineFocusKind,
 }
 
-impl TimelineInnerState {
+impl TimelineState {
     pub(super) fn new(
+        timeline_focus: TimelineFocusKind,
         room_version: RoomVersionId,
-        live_timeline_updates_type: LiveTimelineUpdatesAllowed,
         internal_id_prefix: Option<String>,
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
         is_room_encrypted: bool,
@@ -82,13 +80,13 @@ impl TimelineInnerState {
             // sliding-sync tests with 20 events lag. This should still be
             // small enough.
             items: ObservableVector::with_capacity(32),
-            meta: TimelineInnerMetadata::new(
+            meta: TimelineMetadata::new(
                 room_version,
                 internal_id_prefix,
                 unable_to_decrypt_hook,
                 is_room_encrypted,
             ),
-            live_timeline_updates_type,
+            timeline_focus,
         }
     }
 
@@ -104,7 +102,7 @@ impl TimelineInnerState {
         position: TimelineEnd,
         origin: RemoteEventOrigin,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
+        settings: &TimelineSettings,
     ) -> HandleManyEventsResult {
         if events.is_empty() {
             return Default::default();
@@ -158,14 +156,14 @@ impl TimelineInnerState {
 
     /// Adds a local echo (for an event) to the timeline.
     #[instrument(skip_all)]
-    pub(super) async fn handle_local_event<P: RoomDataProvider>(
+    pub(super) async fn handle_local_event(
         &mut self,
         own_user_id: OwnedUserId,
         own_profile: Option<Profile>,
+        should_add_new_items: bool,
         txn_id: OwnedTransactionId,
         send_handle: Option<SendHandle>,
         content: TimelineEventKind,
-        room_data_provider: &P,
     ) {
         let ctx = TimelineEventContext {
             sender: own_user_id,
@@ -176,6 +174,7 @@ impl TimelineInnerState {
             // An event sent by ourselves is never matched against push rules.
             is_highlighted: false,
             flow: Flow::Local { txn_id, send_handle },
+            should_add_new_items,
         };
 
         let mut txn = self.transaction();
@@ -189,7 +188,6 @@ impl TimelineInnerState {
                 // Local events are never UTD, so no need to pass in a raw_event - this is only
                 // used to determine the type of UTD if there is one.
                 None,
-                room_data_provider,
             )
             .await;
 
@@ -205,7 +203,7 @@ impl TimelineInnerState {
         retry_indices: Vec<usize>,
         push_rules_context: Option<(ruma::push::Ruleset, ruma::push::PushConditionRoomCtx)>,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
+        settings: &TimelineSettings,
     ) where
         Fut: Future<Output = Option<TimelineEvent>>,
     {
@@ -249,99 +247,6 @@ impl TimelineInnerState {
         txn.commit();
     }
 
-    pub(super) fn update_timeline_reaction(
-        &mut self,
-        own_user_id: &UserId,
-        annotation: &Annotation,
-        result: &ReactionToggleResult,
-    ) -> Result<(), TimelineError> {
-        if matches!(result, ReactionToggleResult::RedactSuccess) {
-            // We did a successful redaction, so no need to update the item
-            // because the reaction is already gone.
-            return Ok(());
-        }
-
-        let (remote_echo_to_add, local_echo_to_remove) = match result {
-            ReactionToggleResult::AddSuccess { event_id, txn_id } => (Some(event_id), Some(txn_id)),
-            ReactionToggleResult::AddFailure { txn_id } => (None, Some(txn_id)),
-            ReactionToggleResult::RedactSuccess => (None, None),
-            ReactionToggleResult::RedactFailure { event_id } => (Some(event_id), None),
-        };
-
-        let related = rfind_event_item(&self.items, |it| {
-            it.event_id().is_some_and(|it| it == annotation.event_id)
-        });
-
-        let Some((idx, related)) = related else {
-            // Event isn't found at all.
-            warn!("Timeline item not found, can't update reaction ID");
-            return Err(TimelineError::FailedToToggleReaction);
-        };
-        let Some(remote_related) = related.as_remote() else {
-            error!("inconsistent state: reaction received on a non-remote event item");
-            return Err(TimelineError::FailedToToggleReaction);
-        };
-
-        let new_reactions = {
-            let mut reactions = remote_related.reactions.clone();
-            let reaction_by_sender = reactions.entry(annotation.key.clone()).or_default();
-
-            if let Some(event_id) = remote_echo_to_add {
-                reaction_by_sender.insert(
-                    own_user_id.to_owned(),
-                    ReactionInfo {
-                        // Note: remote event is not synced yet, so we're adding an item
-                        // with the local timestamp.
-                        timestamp: MilliSecondsSinceUnixEpoch::now(),
-                        id: TimelineEventItemId::EventId(event_id.clone()),
-                    },
-                );
-            } else if local_echo_to_remove.is_some() {
-                reaction_by_sender.swap_remove(own_user_id);
-                // Remove the group if we were the last reaction.
-                if reaction_by_sender.is_empty() {
-                    reactions.swap_remove(&annotation.key);
-                }
-            }
-
-            reactions
-        };
-
-        let new_related = related.with_kind(remote_related.with_reactions(new_reactions));
-
-        // Update the reactions stored in the timeline state.
-        {
-            // Remove the local echo from reaction_map.
-            // (should the local echo already be up-to-date after event handling?)
-            if let Some(txn_id) = local_echo_to_remove {
-                let id = TimelineEventItemId::TransactionId(txn_id.clone());
-                if self.meta.reactions.map.remove(&id).is_none() {
-                    warn!(
-                        "Tried to remove reaction by transaction ID, but didn't \
-                         find matching reaction in the reaction map"
-                    );
-                }
-            }
-
-            // Add the remote echo to the reaction_map.
-            if let Some(event_id) = remote_echo_to_add {
-                self.meta.reactions.map.insert(
-                    TimelineEventItemId::EventId(event_id.clone()),
-                    FullReactionKey {
-                        item: TimelineEventItemId::EventId(annotation.event_id.clone()),
-                        key: annotation.key.clone(),
-                        sender: own_user_id.to_owned(),
-                    },
-                );
-            }
-        }
-
-        let item = TimelineItem::new(new_related, related.internal_id.to_owned());
-        self.items.set(idx, item);
-
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(super) fn handle_read_receipts(
         &mut self,
@@ -359,19 +264,19 @@ impl TimelineInnerState {
         txn.commit();
     }
 
-    pub(super) fn transaction(&mut self) -> TimelineInnerStateTransaction<'_> {
+    pub(super) fn transaction(&mut self) -> TimelineStateTransaction<'_> {
         let items = self.items.transaction();
         let meta = self.meta.clone();
-        TimelineInnerStateTransaction {
+        TimelineStateTransaction {
             items,
             previous_meta: &mut self.meta,
             meta,
-            live_timeline_updates_type: self.live_timeline_updates_type.clone(),
+            timeline_focus: self.timeline_focus,
         }
     }
 }
 
-pub(in crate::timeline) struct TimelineInnerStateTransaction<'a> {
+pub(in crate::timeline) struct TimelineStateTransaction<'a> {
     /// A vector transaction over the items themselves. Holds temporary state
     /// until committed.
     pub items: ObservableVectorTransaction<'a, Arc<TimelineItem>>,
@@ -379,16 +284,16 @@ pub(in crate::timeline) struct TimelineInnerStateTransaction<'a> {
     /// A clone of the previous meta, that we're operating on during the
     /// transaction, and that will be committed to the previous meta location in
     /// [`Self::commit`].
-    pub meta: TimelineInnerMetadata,
-
-    /// Which timeline live updates are allowed.
-    pub live_timeline_updates_type: LiveTimelineUpdatesAllowed,
+    pub meta: TimelineMetadata,
 
     /// Pointer to the previous meta, only used during [`Self::commit`].
-    previous_meta: &'a mut TimelineInnerMetadata,
+    previous_meta: &'a mut TimelineMetadata,
+
+    /// The kind of focus of this timeline.
+    timeline_focus: TimelineFocusKind,
 }
 
-impl TimelineInnerStateTransaction<'_> {
+impl TimelineStateTransaction<'_> {
     /// Add the given remote events at the given end of the timeline.
     ///
     /// Note: when the `position` is [`TimelineEnd::Front`], prepended events
@@ -401,7 +306,7 @@ impl TimelineInnerStateTransaction<'_> {
         position: TimelineEnd,
         origin: RemoteEventOrigin,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
+        settings: &TimelineSettings,
     ) -> HandleManyEventsResult {
         let mut total = HandleManyEventsResult::default();
 
@@ -448,17 +353,63 @@ impl TimelineInnerStateTransaction<'_> {
         event: SyncTimelineEvent,
         position: TimelineItemPosition,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
+        settings: &TimelineSettings,
         day_divider_adjuster: &mut DayDividerAdjuster,
     ) -> HandleEventResult {
         let raw = event.event;
         let (event_id, sender, timestamp, txn_id, event_kind, should_add) = match raw.deserialize()
         {
             Ok(event) => {
+                let event_id = event.event_id().to_owned();
                 let room_version = room_data_provider.room_version();
-                let should_add = (settings.event_filter)(&event, &room_version);
+
+                let mut should_add = (settings.event_filter)(&event, &room_version);
+
+                if should_add {
+                    // Retrieve the origin of the event.
+                    let origin = match position {
+                        TimelineItemPosition::End { origin }
+                        | TimelineItemPosition::Start { origin } => origin,
+
+                        TimelineItemPosition::Update(idx) => self
+                            .items
+                            .get(idx)
+                            .and_then(|item| item.as_event())
+                            .and_then(|item| item.as_remote())
+                            .map_or(RemoteEventOrigin::Unknown, |item| item.origin),
+                    };
+
+                    match origin {
+                        RemoteEventOrigin::Sync | RemoteEventOrigin::Unknown => {
+                            should_add = match self.timeline_focus {
+                                TimelineFocusKind::PinnedEvents => {
+                                    // Only insert timeline items for pinned events, if the event
+                                    // came from the sync.
+                                    room_data_provider.is_pinned_event(&event_id)
+                                }
+
+                                TimelineFocusKind::Live => {
+                                    // Always add new items to a live timeline receiving items from
+                                    // sync.
+                                    true
+                                }
+
+                                TimelineFocusKind::Event => {
+                                    // Never add any item to a focused timeline when the item comes
+                                    // down from the sync.
+                                    false
+                                }
+                            };
+                        }
+
+                        RemoteEventOrigin::Pagination | RemoteEventOrigin::Cache => {
+                            // Forward the previous decision to add it.
+                        }
+                    }
+                }
+
                 (
-                    event.event_id().to_owned(),
+                    event_id,
                     event.sender().to_owned(),
                     event.origin_server_ts(),
                     event.transaction_id().map(ToOwned::to_owned),
@@ -568,22 +519,24 @@ impl TimelineInnerStateTransaction<'_> {
                 encryption_info: event.encryption_info,
                 txn_id,
                 position,
-                should_add,
             },
+            should_add_new_items: should_add,
         };
 
         TimelineEventHandler::new(self, ctx)
-            .handle_event(day_divider_adjuster, event_kind, Some(&raw), room_data_provider)
+            .handle_event(day_divider_adjuster, event_kind, Some(&raw))
             .await
     }
 
     fn clear(&mut self) {
+        let has_local_echoes = self.items.iter().any(|item| item.is_local_echo());
+
         // By first checking if there are any local echoes first, we do a bit
         // more work in case some are found, but it should be worth it because
         // there will often not be any, and only emitting a single
         // `VectorDiff::Clear` should be much more efficient to process for
         // subscribers.
-        if self.items.iter().any(|item| item.is_local_echo()) {
+        if has_local_echoes {
             // Remove all remote events and the read marker
             self.items.for_each(|entry| {
                 if entry.is_remote_event() || entry.is_read_marker() {
@@ -607,7 +560,11 @@ impl TimelineInnerStateTransaction<'_> {
             self.items.clear();
         }
 
-        self.meta.clear();
+        // Only clear the internal counter if there are no local echoes. Otherwise, we
+        // might end up reusing the same internal id for a local echo and
+        // another item.
+        let reset_internal_id = !has_local_echoes;
+        self.meta.clear(reset_internal_id);
 
         debug!(remaining_items = self.items.len(), "Timeline cleared");
     }
@@ -632,7 +589,7 @@ impl TimelineInnerStateTransaction<'_> {
         items.commit();
     }
 
-    /// Add or update an event in the [`TimelineInnerMeta::all_events`]
+    /// Add or update an event in the [`TimelineMetadata::all_events`]
     /// collection.
     ///
     /// This method also adjusts read receipt if needed.
@@ -645,9 +602,9 @@ impl TimelineInnerStateTransaction<'_> {
         event_meta: FullEventMeta<'_>,
         position: TimelineItemPosition,
         room_data_provider: &P,
-        settings: &TimelineInnerSettings,
+        settings: &TimelineSettings,
     ) -> bool {
-        // Detect if an event already exists in [`TimelineInnerMeta::all_events`].
+        // Detect if an event already exists in [`TimelineMetadata::all_events`].
         //
         // Returns its position, in this case.
         fn event_already_exists(
@@ -714,7 +671,7 @@ impl TimelineInnerStateTransaction<'_> {
 }
 
 #[derive(Clone, Debug)]
-pub(in crate::timeline) struct TimelineInnerMetadata {
+pub(in crate::timeline) struct TimelineMetadata {
     // **** CONSTANT FIELDS ****
     /// An optional prefix for internal IDs, defined during construction of the
     /// timeline.
@@ -758,7 +715,7 @@ pub(in crate::timeline) struct TimelineInnerMetadata {
     pub read_receipts: ReadReceipts,
 }
 
-impl TimelineInnerMetadata {
+impl TimelineMetadata {
     pub(crate) fn new(
         room_version: RoomVersionId,
         internal_id_prefix: Option<String>,
@@ -782,8 +739,10 @@ impl TimelineInnerMetadata {
         }
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.next_internal_id = 0;
+    pub(crate) fn clear(&mut self, reset_internal_id: bool) {
+        if reset_internal_id {
+            self.next_internal_id = 0;
+        }
         self.all_events.clear();
         self.reactions.clear();
         self.poll_pending_events.clear();
