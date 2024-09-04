@@ -56,7 +56,7 @@ use ruma::{
     UserId,
 };
 use ruma::events::poll::unstable_response::UnstablePollResponseEventContent;
-use ruma::events::poll::unstable_start::NewUnstablePollStartEventContent;
+use ruma::events::poll::unstable_start::{NewUnstablePollStartEventContent, NewUnstablePollStartEventContentWithoutRelation};
 use thiserror::Error;
 use tracing::{error, instrument, trace, warn};
 use matrix_sdk::room::edit::EditError;
@@ -487,6 +487,15 @@ impl Timeline {
         unique_id: &str,
         new_content: RoomMessageEventContentWithoutRelation,
     ) -> Result<bool, Error> {
+        let new_content = EditedContent::RoomMessage(new_content);
+        self.do_edit(unique_id, new_content).await
+    }
+
+    async fn do_edit(
+        &self,
+        unique_id: &str,
+        new_content: EditedContent,
+    ) -> Result<bool, Error> {
         if let Some((_, event)) = rfind_event_by_uid(&self.controller.items().await, unique_id) {
             let event_id = match event.identifier() {
                 TimelineEventItemId::TransactionId(txn_id) => {
@@ -496,9 +505,19 @@ impl Timeline {
                             TimelineItemHandle::Remote(event_id) => event_id.to_owned(),
                             TimelineItemHandle::Local(handle) => {
                                 // Relations are filled by the editing code itself.
-                                let new_content: RoomMessageEventContent = new_content.clone().into();
+                                let new_content: AnyMessageLikeEventContent = match new_content {
+                                    EditedContent::RoomMessage(message) => {
+                                        AnyMessageLikeEventContent::RoomMessage(message.into())
+                                    }
+                                    EditedContent::PollStart(_, poll_start) => {
+                                        let content = UnstablePollStartEventContent::New(
+                                            NewUnstablePollStartEventContent::new(poll_start)
+                                        );
+                                        AnyMessageLikeEventContent::UnstablePollStart(content.into())
+                                    }
+                            };
                                 return Ok(handle
-                                    .edit(new_content.into())
+                                    .edit(new_content)
                                     .await
                                     .map_err(RoomSendQueueError::StorageError)?);
                             }
@@ -513,7 +532,7 @@ impl Timeline {
             };
 
             let content =
-                self.room().make_edit_event(&event_id, EditedContent::RoomMessage(new_content)).await?;
+                self.room().make_edit_event(&event_id, new_content).await?;
 
             self.send(content).await?;
 
@@ -565,35 +584,8 @@ impl Timeline {
         poll: UnstablePollStartContentBlock,
         edit_unique_id: &str,
     ) -> Result<bool, Error> {
-        // TODO: refactor this function into [`Self::edit`], there's no good reason to
-        // keep a separate function for this.
-
-        if let Some((_, edit_item)) = rfind_event_by_uid(&self.controller.items().await, edit_unique_id) {
-            // Early returns here must be in sync with `EventTimelineItem::is_editable`.
-            if !edit_item.is_own() {
-                return Err(EditError::NotAuthor.into());
-            }
-            let event_id = match edit_item.identifier() {
-                TimelineEventItemId::EventId(event_id) => event_id,
-                TimelineEventItemId::TransactionId(transaction_id) => return Err(EditError::MissingOriginalEvent(transaction_id).into())
-            };
-
-            let TimelineItemContent::Poll(_) = edit_item.content() else {
-                return Err(EditError::IncompatibleEditType { target: edit_item.content().debug_string().to_string(), new_content: "poll start" }.into());
-            };
-
-            let content = ReplacementUnstablePollStartEventContent::plain_text(
-                fallback_text,
-                poll,
-                event_id.into(),
-            );
-
-            self.send(UnstablePollStartEventContent::from(content).into()).await.map_err(|err| EditError::Send(Box::new(err)))?;
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let new_content = EditedContent::PollStart(fallback_text.into(), poll);
+        self.do_edit(edit_unique_id, new_content).await
     }
 
     /// Toggle a reaction on an event.
