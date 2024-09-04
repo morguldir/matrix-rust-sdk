@@ -25,11 +25,11 @@ use crate::{
     error::ClientError,
     room::{Membership, Room},
     room_info::RoomInfo,
-    timeline::{EventTimelineItem, Timeline},
+    timeline::Timeline,
     timeline_event_filter::TimelineEventTypeFilter,
     TaskHandle, RUNTIME,
 };
-use crate::timeline::FFIEventTimelineItem;
+use crate::timeline::EventTimelineItem;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum RoomListError {
@@ -703,7 +703,7 @@ impl RoomListItem {
         self.inner.is_encrypted().await.unwrap_or(false)
     }
 
-    async fn latest_event(&self) -> Option<FFIEventTimelineItem> {
+    async fn latest_event(&self) -> Option<EventTimelineItem> {
         self.inner.latest_event().await.map(|e| e.into())
     }
 }

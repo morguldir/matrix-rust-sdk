@@ -57,7 +57,7 @@ use crate::{
     utils::u64_to_uint,
     timeline::FFIMessage,
 };
-use crate::timeline::FFIEventTimelineItem;
+use crate::timeline::EventTimelineItem;
 
 #[derive(uniffi::Enum)]
 pub enum AuthData {

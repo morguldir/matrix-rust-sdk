@@ -486,10 +486,20 @@ impl Timeline {
     /// local events that are being processed.
     pub async fn edit(
         &self,
-        item: Arc<EventTimelineItem>,
+        id: String,
         new_content: Arc<RoomMessageEventContentWithoutRelation>,
     ) -> Result<bool, ClientError> {
-        self.inner.edit(&item.0, (*new_content).clone()).await.map_err(ClientError::from)
+        let event = if let Ok(event_id) = EventId::parse(&id) {
+            self.inner.item_by_event_id(&event_id).await
+        } else {
+            let transaction_id: OwnedTransactionId = id.into();
+            self.inner.local_item_by_transaction_id(&transaction_id).await
+        };
+        if let Some(event) = event {
+            self.inner.edit(&event, (*new_content).clone()).await.map_err(ClientError::from)
+        } else {
+            Ok(false)
+        }
     }
 
     pub async fn edit_poll(
@@ -498,14 +508,19 @@ impl Timeline {
         answers: Vec<String>,
         max_selections: u8,
         poll_kind: PollKind,
-        edit_item: Arc<EventTimelineItem>,
-    ) -> Result<(), ClientError> {
-        let poll_data = PollData { question, answers, max_selections, poll_kind };
-        self.inner
-            .edit_poll(poll_data.fallback_text(), poll_data.try_into()?, &edit_item.0)
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
-        Ok(())
+        id: String,
+    ) -> Result<bool, ClientError> {
+        let event_id = EventId::parse(id)?;
+        if let Some(event) = self.inner.item_by_event_id(&event_id).await {
+            let poll_data = PollData { question, answers, max_selections, poll_kind };
+            self.inner
+                .edit_poll(poll_data.fallback_text(), poll_data.try_into()?, &event)
+                .await
+                .map(|_| true)
+                .map_err(|err| anyhow::anyhow!(err).into())
+        } else {
+            Ok(false)
+        }
     }
 
     pub async fn send_location(
@@ -571,7 +586,7 @@ impl Timeline {
     pub async fn get_event_timeline_item_by_event_id(
         &self,
         event_id: String,
-    ) -> Result<FFIEventTimelineItem, ClientError> {
+    ) -> Result<EventTimelineItem, ClientError> {
         let event_id = EventId::parse(event_id)?;
         let item = self
             .inner
@@ -591,14 +606,14 @@ impl Timeline {
     pub async fn get_event_timeline_item_by_transaction_id(
         &self,
         transaction_id: String,
-    ) -> Result<Arc<EventTimelineItem>, ClientError> {
+    ) -> Result<EventTimelineItem, ClientError> {
         let transaction_id: OwnedTransactionId = transaction_id.into();
         let item = self
             .inner
             .local_item_by_transaction_id(&transaction_id)
             .await
             .context("Item with given transaction ID not found")?;
-        Ok(Arc::new(EventTimelineItem(item)))
+        Ok(item.into())
     }
 
     /// Redacts an event from the timeline.
@@ -613,16 +628,26 @@ impl Timeline {
     /// local events that are being processed.
     pub async fn redact_event(
         &self,
-        item: Arc<EventTimelineItem>,
+        id: String,
         reason: Option<String>,
     ) -> Result<bool, ClientError> {
-        let removed = self
-            .inner
-            .redact(&item.0, reason.as_deref())
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
+        let event = if let Ok(event_id) = EventId::parse(&id) {
+            self.inner.item_by_event_id(&event_id).await
+        } else {
+            let transaction_id: OwnedTransactionId = id.into();
+            self.inner.local_item_by_transaction_id(&transaction_id).await
+        };
+        if let Some(event) = event {
+            let removed = self
+                .inner
+                .redact(&event, reason.as_deref())
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
 
-        Ok(removed)
+            Ok(removed)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Load the reply details for the given event id.
@@ -889,7 +914,7 @@ impl TimelineItem {
 
 #[uniffi::export]
 impl TimelineItem {
-    pub fn as_event(self: Arc<Self>) -> Option<FFIEventTimelineItem> {
+    pub fn as_event(self: Arc<Self>) -> Option<EventTimelineItem> {
         let event_item = self.0.as_event()?;
         Some(event_item.clone().into())
     }
@@ -1000,7 +1025,7 @@ fn event_send_state_from_sending_failed(error: &Error, is_recoverable: bool) -> 
 
 /// Recommended decorations for decrypted messages, representing the message's
 /// authenticity properties.
-#[derive(uniffi::Enum)]
+#[derive(uniffi::Enum, Clone)]
 pub enum ShieldState {
     /// A red shield with a tooltip containing the associated message should be
     /// presented.
@@ -1027,7 +1052,7 @@ impl From<RustShieldState> for ShieldState {
 }
 
 #[derive(Clone, uniffi::Record)]
-pub struct FFIEventTimelineItem {
+pub struct EventTimelineItem {
     is_local: bool,
     is_remote: bool,
     transaction_id: Option<String>,
@@ -1044,9 +1069,10 @@ pub struct FFIEventTimelineItem {
     read_receipts: HashMap<String, Receipt>,
     origin: Option<EventItemOrigin>,
     can_be_replied_to: bool,
+    message_shield: Option<ShieldState>,
 }
 
-impl FFIEventTimelineItem {
+impl EventTimelineItem {
     pub(crate) fn identifier(&self) -> TimelineEventItemId {
         if let Some(Ok(id)) = self.event_id.clone().map(|i| EventId::parse(&i)) {
             TimelineEventItemId::EventId(id.clone())
@@ -1058,7 +1084,7 @@ impl FFIEventTimelineItem {
     }
 }
 
-impl From<matrix_sdk_ui::timeline::EventTimelineItem> for FFIEventTimelineItem {
+impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
     fn from(value: matrix_sdk_ui::timeline::EventTimelineItem) -> Self {
         let reactions = value
             .reactions()
@@ -1096,103 +1122,104 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for FFIEventTimelineItem {
             local_send_state: value.send_state().map(|s| s.into()),
             read_receipts,
             origin: value.origin(),
-            can_be_replied_to: value.can_be_replied_to()
+            can_be_replied_to: value.can_be_replied_to(),
+            message_shield: value.get_shield(false).map(Into::into),
         }
     }
 }
 
-#[derive(uniffi::Object)]
-pub struct EventTimelineItem(pub(crate) matrix_sdk_ui::timeline::EventTimelineItem);
-
-#[uniffi::export]
-impl EventTimelineItem {
-    pub fn is_local(&self) -> bool {
-        self.0.is_local_echo()
-    }
-
-    pub fn is_remote(&self) -> bool {
-        !self.0.is_local_echo()
-    }
-
-    pub fn transaction_id(&self) -> Option<String> {
-        self.0.transaction_id().map(ToString::to_string)
-    }
-
-    pub fn event_id(&self) -> Option<String> {
-        self.0.event_id().map(ToString::to_string)
-    }
-
-    pub fn sender(&self) -> String {
-        self.0.sender().to_string()
-    }
-
-    pub fn sender_profile(&self) -> ProfileDetails {
-        self.0.sender_profile().into()
-    }
-
-    pub fn is_own(&self) -> bool {
-        self.0.is_own()
-    }
-
-    pub fn is_editable(&self) -> bool {
-        self.0.is_editable()
-    }
-
-    pub fn content(&self) -> TimelineItemContent {
-        self.0.content().into()
-    }
-
-    pub fn timestamp(&self) -> u64 {
-        self.0.timestamp().0.into()
-    }
-
-    pub fn reactions(&self) -> Vec<Reaction> {
-        self.0
-            .reactions()
-            .iter()
-            .map(|(k, v)| Reaction {
-                key: k.to_owned(),
-                senders: v
-                    .iter()
-                    .map(|(sender_id, info)| ReactionSenderData {
-                        sender_id: sender_id.to_string(),
-                        timestamp: info.timestamp.0.into(),
-                    })
-                    .collect(),
-            })
-            .collect()
-    }
-
-    pub fn debug_info(&self) -> EventTimelineItemDebugInfo {
-        EventTimelineItemDebugInfo {
-            model: format!("{:#?}", self.0),
-            original_json: self.0.original_json().map(|raw| raw.json().get().to_owned()),
-            latest_edit_json: self.0.latest_edit_json().map(|raw| raw.json().get().to_owned()),
-        }
-    }
-
-    pub fn local_send_state(&self) -> Option<EventSendState> {
-        self.0.send_state().map(Into::into)
-    }
-
-    pub fn read_receipts(&self) -> HashMap<String, Receipt> {
-        self.0.read_receipts().iter().map(|(k, v)| (k.to_string(), v.clone().into())).collect()
-    }
-
-    pub fn origin(&self) -> Option<EventItemOrigin> {
-        self.0.origin()
-    }
-
-    pub fn can_be_replied_to(&self) -> bool {
-        self.0.can_be_replied_to()
-    }
-
-    /// Gets the [`ShieldState`] which can be used to decorate messages in the
-    /// recommended way.
-    pub fn get_shield(&self, strict: bool) -> Option<ShieldState> {
-        self.0.get_shield(strict).map(Into::into)
-    }
-}
+// #[derive(uniffi::Object)]
+// pub struct EventTimelineItem(pub(crate) matrix_sdk_ui::timeline::EventTimelineItem);
+//
+// #[uniffi::export]
+// impl EventTimelineItem {
+//     pub fn is_local(&self) -> bool {
+//         self.0.is_local_echo()
+//     }
+//
+//     pub fn is_remote(&self) -> bool {
+//         !self.0.is_local_echo()
+//     }
+//
+//     pub fn transaction_id(&self) -> Option<String> {
+//         self.0.transaction_id().map(ToString::to_string)
+//     }
+//
+//     pub fn event_id(&self) -> Option<String> {
+//         self.0.event_id().map(ToString::to_string)
+//     }
+//
+//     pub fn sender(&self) -> String {
+//         self.0.sender().to_string()
+//     }
+//
+//     pub fn sender_profile(&self) -> ProfileDetails {
+//         self.0.sender_profile().into()
+//     }
+//
+//     pub fn is_own(&self) -> bool {
+//         self.0.is_own()
+//     }
+//
+//     pub fn is_editable(&self) -> bool {
+//         self.0.is_editable()
+//     }
+//
+//     pub fn content(&self) -> TimelineItemContent {
+//         self.0.content().into()
+//     }
+//
+//     pub fn timestamp(&self) -> u64 {
+//         self.0.timestamp().0.into()
+//     }
+//
+//     pub fn reactions(&self) -> Vec<Reaction> {
+//         self.0
+//             .reactions()
+//             .iter()
+//             .map(|(k, v)| Reaction {
+//                 key: k.to_owned(),
+//                 senders: v
+//                     .iter()
+//                     .map(|(sender_id, info)| ReactionSenderData {
+//                         sender_id: sender_id.to_string(),
+//                         timestamp: info.timestamp.0.into(),
+//                     })
+//                     .collect(),
+//             })
+//             .collect()
+//     }
+//
+//     pub fn debug_info(&self) -> EventTimelineItemDebugInfo {
+//         EventTimelineItemDebugInfo {
+//             model: format!("{:#?}", self.0),
+//             original_json: self.0.original_json().map(|raw| raw.json().get().to_owned()),
+//             latest_edit_json: self.0.latest_edit_json().map(|raw| raw.json().get().to_owned()),
+//         }
+//     }
+//
+//     pub fn local_send_state(&self) -> Option<EventSendState> {
+//         self.0.send_state().map(Into::into)
+//     }
+//
+//     pub fn read_receipts(&self) -> HashMap<String, Receipt> {
+//         self.0.read_receipts().iter().map(|(k, v)| (k.to_string(), v.clone().into())).collect()
+//     }
+//
+//     pub fn origin(&self) -> Option<EventItemOrigin> {
+//         self.0.origin()
+//     }
+//
+//     pub fn can_be_replied_to(&self) -> bool {
+//         self.0.can_be_replied_to()
+//     }
+//
+//     /// Gets the [`ShieldState`] which can be used to decorate messages in the
+//     /// recommended way.
+//     pub fn get_shield(&self, strict: bool) -> Option<ShieldState> {
+//         self.0.get_shield(strict).map(Into::into)
+//     }
+// }
 
 #[derive(Clone, uniffi::Record)]
 pub struct Receipt {
