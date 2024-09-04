@@ -17,17 +17,15 @@
 use std::future::Future;
 
 use matrix_sdk_base::{deserialized_responses::SyncTimelineEvent, SendOutsideWasm};
-use ruma::{
-    events::{
-        room::message::{Relation, ReplacementMetadata, RoomMessageEventContentWithoutRelation},
-        AnyMessageLikeEvent, AnyMessageLikeEventContent, AnySyncMessageLikeEvent,
-        AnySyncTimelineEvent, AnyTimelineEvent, MessageLikeEvent, SyncMessageLikeEvent,
-    },
-    EventId, RoomId, UserId,
-};
+use ruma::{events::{
+    room::message::{Relation, ReplacementMetadata, RoomMessageEventContentWithoutRelation},
+    AnyMessageLikeEvent, AnyMessageLikeEventContent, AnySyncMessageLikeEvent,
+    AnySyncTimelineEvent, AnyTimelineEvent, MessageLikeEvent, SyncMessageLikeEvent,
+}, EventId, OwnedTransactionId, RoomId, TransactionId, UserId};
 use thiserror::Error;
 use tracing::{debug, instrument, trace, warn};
 
+use crate::send_queue::RoomSendQueueError;
 use crate::Room;
 
 /// The new content that will replace the previous event's content.
@@ -60,6 +58,14 @@ pub enum EditError {
     /// We couldn't fetch the remote event with /room/event.
     #[error("Couldn't fetch the remote event: {0}")]
     Fetch(Box<crate::Error>),
+
+    /// The request to edit th event failed.
+    #[error("Couldn't edit the remote event: {0}")]
+    Send(Box<RoomSendQueueError>),
+
+    /// The item you tried to edit is not a remote one.
+    #[error("The item you tried to edit is not a remote one: {0}.")]
+    MissingOriginalEvent(OwnedTransactionId),
 
     /// We couldn't properly deserialize the target event.
     #[error(transparent)]

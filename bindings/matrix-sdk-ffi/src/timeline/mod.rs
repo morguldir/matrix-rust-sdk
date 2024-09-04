@@ -419,39 +419,15 @@ impl Timeline {
             poll_data.fallback_text(),
             poll_data.try_into()?,
         );
-        let event_content =
-            AnyMessageLikeEventContent::UnstablePollStart(poll_start_event_content.into());
-
-        if let Err(err) = self.inner.send(event_content).await {
-            error!("unable to start poll: {err}");
-        }
-
-        Ok(())
+        self.inner.create_poll(poll_start_event_content).await.map_err(Into::into)
     }
 
     pub async fn send_poll_response(
         self: Arc<Self>,
         poll_start_id: UniqueId,
         answers: Vec<String>,
-    ) -> Result<(), ClientError> {
-        let poll_start_event_id = self
-            .inner
-            .item_by_unique_id(&poll_start_id.value)
-            .await
-            .and_then(|event| event.event_id().map(|id| id.to_owned()));
-        if let Some(event_id) = poll_start_event_id {
-            let poll_response_event_content =
-                UnstablePollResponseEventContent::new(answers, event_id);
-            let event_content =
-                AnyMessageLikeEventContent::UnstablePollResponse(poll_response_event_content);
-
-            if let Err(err) = self.inner.send(event_content).await {
-                error!("unable to send poll response: {err}");
-            }
-            Ok(())
-        } else {
-            Err(ClientError::new(format!("Event with unique id {poll_start_id} not found.")))
-        }
+    ) -> Result<bool, ClientError> {
+        self.inner.send_poll_response(&poll_start_id.value, answers).await.map_err(Into::into)
     }
 
     pub async fn end_poll(
@@ -512,11 +488,7 @@ impl Timeline {
         id: UniqueId,
         new_content: Arc<RoomMessageEventContentWithoutRelation>,
     ) -> Result<bool, ClientError> {
-        if let Some(event) = self.inner.item_by_unique_id(&id.value).await {
-            self.inner.edit(&event, (*new_content).clone()).await.map_err(ClientError::from)
-        } else {
-            Ok(false)
-        }
+        self.inner.edit(&id.value, (*new_content).clone()).await.map_err(ClientError::from)
     }
 
     pub async fn edit_poll(
@@ -527,16 +499,11 @@ impl Timeline {
         poll_kind: PollKind,
         id: UniqueId,
     ) -> Result<bool, ClientError> {
-        if let Some(event) = self.inner.item_by_unique_id(&id.value).await {
-            let poll_data = PollData { question, answers, max_selections, poll_kind };
-            self.inner
-                .edit_poll(poll_data.fallback_text(), poll_data.try_into()?, &event)
-                .await
-                .map(|_| true)
-                .map_err(|err| anyhow::anyhow!(err).into())
-        } else {
-            Ok(false)
-        }
+        let poll_data = PollData { question, answers, max_selections, poll_kind };
+        self.inner
+            .edit_poll(poll_data.fallback_text(), poll_data.try_into()?, &id.value)
+            .await
+            .map_err(|err| anyhow::anyhow!(err).into())
     }
 
     pub async fn send_location(
@@ -659,17 +626,13 @@ impl Timeline {
         id: UniqueId,
         reason: Option<String>,
     ) -> Result<bool, ClientError> {
-        if let Some(event) = self.inner.item_by_unique_id(&id.value).await {
-            let removed = self
-                .inner
-                .redact(&event, reason.as_deref())
-                .await
-                .map_err(|err| anyhow::anyhow!(err))?;
+        let removed = self
+            .inner
+            .redact(&id.value, reason.as_deref())
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
 
-            Ok(removed)
-        } else {
-            Ok(false)
-        }
+        Ok(removed)
     }
 
     /// Load the reply details for the given event id.

@@ -55,9 +55,11 @@ use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, RoomVersionId, TransactionId,
     UserId,
 };
+use ruma::events::poll::unstable_response::UnstablePollResponseEventContent;
+use ruma::events::poll::unstable_start::NewUnstablePollStartEventContent;
 use thiserror::Error;
 use tracing::{error, instrument, trace, warn};
-
+use matrix_sdk::room::edit::EditError;
 use crate::timeline::{pinned_events_loader::PinnedEventsRoom, util::rfind_event_by_uid};
 
 mod builder;
@@ -482,71 +484,116 @@ impl Timeline {
     #[instrument(skip(self, new_content))]
     pub async fn edit(
         &self,
-        item: &EventTimelineItem,
+        unique_id: &str,
         new_content: RoomMessageEventContentWithoutRelation,
     ) -> Result<bool, Error> {
-        let event_id = match item.identifier() {
-            TimelineEventItemId::TransactionId(txn_id) => {
-                // See if we have an up-to-date timeline item with that transaction id.
-                if let Some(item) = self.item_by_transaction_id(&txn_id).await {
-                    match item.handle() {
-                        TimelineItemHandle::Remote(event_id) => event_id.to_owned(),
-                        TimelineItemHandle::Local(handle) => {
-                            // Relations are filled by the editing code itself.
-                            let new_content: RoomMessageEventContent = new_content.clone().into();
-                            return Ok(handle
-                                .edit(new_content.into())
-                                .await
-                                .map_err(RoomSendQueueError::StorageError)?);
+        if let Some((_, event)) = rfind_event_by_uid(&self.controller.items().await, unique_id) {
+            let event_id = match event.identifier() {
+                TimelineEventItemId::TransactionId(txn_id) => {
+                    // See if we have an up-to-date timeline item with that transaction id.
+                    if let Some(item) = self.item_by_transaction_id(&txn_id).await {
+                        match item.handle() {
+                            TimelineItemHandle::Remote(event_id) => event_id.to_owned(),
+                            TimelineItemHandle::Local(handle) => {
+                                // Relations are filled by the editing code itself.
+                                let new_content: RoomMessageEventContent = new_content.clone().into();
+                                return Ok(handle
+                                    .edit(new_content.into())
+                                    .await
+                                    .map_err(RoomSendQueueError::StorageError)?);
+                            }
                         }
+                    } else {
+                        warn!("Couldn't find the local echo anymore, nor a matching remote echo");
+                        return Ok(false);
                     }
-                } else {
-                    warn!("Couldn't find the local echo anymore, nor a matching remote echo");
-                    return Ok(false);
                 }
+
+                TimelineEventItemId::EventId(event_id) => event_id,
+            };
+
+            let content =
+                self.room().make_edit_event(&event_id, EditedContent::RoomMessage(new_content)).await?;
+
+            self.send(content).await?;
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn create_poll(
+        &self,
+        poll_start_content: NewUnstablePollStartEventContent,
+    ) -> Result<(), RoomSendQueueError> {
+        let event_content =
+            AnyMessageLikeEventContent::UnstablePollStart(poll_start_content.into());
+
+        self.send(event_content).await?;
+
+        Ok(())
+    }
+
+    pub async fn send_poll_response(
+        &self,
+        unique_id: &str,
+        answers: Vec<String>,
+    ) -> Result<bool, RoomSendQueueError> {
+        if let Some((_, event)) = rfind_event_by_uid(&self.controller.items().await, unique_id) {
+            match event.identifier() {
+                TimelineEventItemId::EventId(event_id) => {
+                    let poll_response_event_content =
+                        UnstablePollResponseEventContent::new(answers, event_id);
+                    let event_content =
+                        AnyMessageLikeEventContent::UnstablePollResponse(poll_response_event_content);
+
+                    self.send(event_content).await?;
+
+                    Ok(true)
+                }
+                TimelineEventItemId::TransactionId(_) => Ok(false)
             }
-
-            TimelineEventItemId::EventId(event_id) => event_id,
-        };
-
-        let content =
-            self.room().make_edit_event(&event_id, EditedContent::RoomMessage(new_content)).await?;
-
-        self.send(content).await?;
-
-        Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub async fn edit_poll(
         &self,
         fallback_text: impl Into<String>,
         poll: UnstablePollStartContentBlock,
-        edit_item: &EventTimelineItem,
-    ) -> Result<(), SendEventError> {
+        edit_unique_id: &str,
+    ) -> Result<bool, Error> {
         // TODO: refactor this function into [`Self::edit`], there's no good reason to
         // keep a separate function for this.
 
-        // Early returns here must be in sync with `EventTimelineItem::is_editable`.
-        if !edit_item.is_own() {
-            return Err(UnsupportedEditItem::NotOwnEvent.into());
+        if let Some((_, edit_item)) = rfind_event_by_uid(&self.controller.items().await, edit_unique_id) {
+            // Early returns here must be in sync with `EventTimelineItem::is_editable`.
+            if !edit_item.is_own() {
+                return Err(EditError::NotAuthor.into());
+            }
+            let event_id = match edit_item.identifier() {
+                TimelineEventItemId::EventId(event_id) => event_id,
+                TimelineEventItemId::TransactionId(transaction_id) => return Err(EditError::MissingOriginalEvent(transaction_id).into())
+            };
+
+            let TimelineItemContent::Poll(_) = edit_item.content() else {
+                return Err(EditError::IncompatibleEditType { target: edit_item.content().debug_string().to_string(), new_content: "poll start" }.into());
+            };
+
+            let content = ReplacementUnstablePollStartEventContent::plain_text(
+                fallback_text,
+                poll,
+                event_id.into(),
+            );
+
+            self.send(UnstablePollStartEventContent::from(content).into()).await.map_err(|err| EditError::Send(Box::new(err)))?;
+
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        let Some(event_id) = edit_item.event_id() else {
-            return Err(UnsupportedEditItem::MissingEvent.into());
-        };
-
-        let TimelineItemContent::Poll(_) = edit_item.content() else {
-            return Err(UnsupportedEditItem::NotPollEvent.into());
-        };
-
-        let content = ReplacementUnstablePollStartEventContent::plain_text(
-            fallback_text,
-            poll,
-            event_id.into(),
-        );
-
-        self.send(UnstablePollStartEventContent::from(content).into()).await?;
-
-        Ok(())
     }
 
     /// Toggle a reaction on an event.
@@ -603,34 +650,38 @@ impl Timeline {
     ///   interacting with the sending queue.
     pub async fn redact(
         &self,
-        event: &EventTimelineItem,
+        unique_id: &str,
         reason: Option<&str>,
     ) -> Result<bool, Error> {
-        let event_id = match event.identifier() {
-            TimelineEventItemId::TransactionId(txn_id) => {
-                // See if we have an up-to-date timeline item with that transaction id.
-                if let Some(item) = self.item_by_transaction_id(&txn_id).await {
-                    match item.handle() {
-                        TimelineItemHandle::Remote(event_id) => event_id.to_owned(),
-                        TimelineItemHandle::Local(handle) => {
-                            return Ok(handle
-                                .abort()
-                                .await
-                                .map_err(RoomSendQueueError::StorageError)?);
+        if let Some((_, event)) = rfind_event_by_uid(&self.controller.items().await, unique_id) {
+            let event_id = match event.identifier() {
+                TimelineEventItemId::TransactionId(txn_id) => {
+                    // See if we have an up-to-date timeline item with that transaction id.
+                    if let Some(item) = self.item_by_transaction_id(&txn_id).await {
+                        match item.handle() {
+                            TimelineItemHandle::Remote(event_id) => event_id.to_owned(),
+                            TimelineItemHandle::Local(handle) => {
+                                return Ok(handle
+                                    .abort()
+                                    .await
+                                    .map_err(RoomSendQueueError::StorageError)?);
+                            }
                         }
+                    } else {
+                        warn!("Couldn't find the local echo anymore, nor a matching remote echo");
+                        return Ok(false);
                     }
-                } else {
-                    warn!("Couldn't find the local echo anymore, nor a matching remote echo");
-                    return Ok(false);
                 }
-            }
 
-            TimelineEventItemId::EventId(event_id) => event_id,
-        };
+                TimelineEventItemId::EventId(event_id) => event_id,
+            };
 
-        self.room().redact(&event_id, reason, None).await.map_err(Error::RedactError)?;
+            self.room().redact(&event_id, reason, None).await.map_err(Error::RedactError)?;
 
-        Ok(true)
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Fetch unavailable details about the event with the given ID.
