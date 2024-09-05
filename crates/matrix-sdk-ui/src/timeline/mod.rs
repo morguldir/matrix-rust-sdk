@@ -517,38 +517,6 @@ impl Timeline {
         Ok(true)
     }
 
-    // pub async fn edit_poll(
-    //     &self,
-    //     fallback_text: impl Into<String>,
-    //     poll: UnstablePollStartContentBlock,
-    //     edit_item: &EventTimelineItem,
-    // ) -> Result<bool, error> {
-    //     // TODO: refactor this function into [`Self::edit`], there's no good
-    // reason to     // keep a separate function for this.
-    //
-    //     // Early returns here must be in sync with
-    // `EventTimelineItem::is_editable`.     if !edit_item.is_own() {
-    //         return Err(UnsupportedEditItem::NotOwnEvent.into());
-    //     }
-    //     let Some(event_id) = edit_item.event_id() else {
-    //         return Err(UnsupportedEditItem::MissingEvent.into());
-    //     };
-    //
-    //     let TimelineItemContent::Poll(_) = edit_item.content() else {
-    //         return Err(UnsupportedEditItem::NotPollEvent.into());
-    //     };
-    //
-    //     let content = ReplacementUnstablePollStartEventContent::plain_text(
-    //         fallback_text,
-    //         poll,
-    //         event_id.into(),
-    //     );
-    //
-    //     self.send(UnstablePollStartEventContent::from(content).into()).await?;
-    //
-    //     Ok(())
-    // }
-
     /// Toggle a reaction on an event.
     ///
     /// The `unique_id` parameter is a string returned by
