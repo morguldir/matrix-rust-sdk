@@ -20,9 +20,12 @@ use assert_matches2::assert_let;
 use assign::assign;
 use eyeball_im::{Vector, VectorDiff};
 use futures_util::{FutureExt, StreamExt};
-use matrix_sdk::ruma::{
-    api::client::room::create_room::v3::Request as CreateRoomRequest,
-    events::room::message::RoomMessageEventContent, MilliSecondsSinceUnixEpoch,
+use matrix_sdk::{
+    room::edit::EditedContent,
+    ruma::{
+        api::client::room::create_room::v3::Request as CreateRoomRequest,
+        events::room::message::RoomMessageEventContent, MilliSecondsSinceUnixEpoch,
+    },
 };
 use matrix_sdk_ui::timeline::{EventSendState, ReactionStatus, RoomExt, TimelineItem};
 use tokio::{
@@ -31,7 +34,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tracing::{debug, warn};
-use matrix_sdk::room::edit::EditedContent;
+
 use crate::helpers::TestClientBuilder;
 
 /// Checks that there a timeline update, and returns the EventTimelineItem.
@@ -278,7 +281,10 @@ async fn test_stale_local_echo_time_abort_edit() {
 
     // Now do a crime: try to edit the local echo.
     let did_edit = timeline
-        .edit(&local_echo, EditedContent::RoomMessage(RoomMessageEventContent::text_plain("bonjour").into()))
+        .edit(
+            &local_echo,
+            EditedContent::RoomMessage(RoomMessageEventContent::text_plain("bonjour").into()),
+        )
         .await
         .unwrap();
 
