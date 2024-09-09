@@ -74,8 +74,8 @@ tokio-stream = "0.1.14"
 tracing = { version = "0.1.40", default-features = false, features = ["std"] }
 tracing-core = "0.1.32"
 tracing-subscriber = "0.3.18"
-uniffi = { version = "0.28.0" }
-uniffi_bindgen = { version = "0.28.0" }
+uniffi = "0.25.3"
+uniffi_bindgen = { git = "https://github.com/mozilla/uniffi-rs", rev = "0a03b713306d6ce3de033157fc2ce92a238c2e24" }
 url = "2.5.0"
 vodozemac = { version = "0.7.0" }
 wiremock = "0.6.0"
